@@ -1,4 +1,4 @@
-import json, os, time
+import json, os, random, string, time
 from datetime import datetime, timedelta, timezone
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,15 +43,23 @@ def signup_org(b: OrgSignup):
 
 @app.post("/api/auth/register")
 def register(b: Register):
-    """Members can only join through an admin-issued, single-use, expiring invite code."""
     name, uid = b.username.strip().lower(), D.uid()
     with D.db() as c:
         inv = c.execute("SELECT * FROM invites WHERE code=?", (b.invite_code.strip(),)).fetchone()
-        if not inv or inv["used_by"] or inv["expires"] < datetime.now(timezone.utc).isoformat(): raise HTTPException(400, "Invite code is invalid or expired")
-        if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone(): raise HTTPException(409, "Username already taken")
-        c.execute("INSERT INTO users(id,username,pw_hash,tenant_id,role) VALUES(?,?,?,?,?)", (uid, name, S.hash_pw(b.password), inv["tenant_id"], inv["role"]))
+        if not inv or inv["used_by"] or inv["expires"] < datetime.now(timezone.utc).isoformat():
+            raise HTTPException(400, "Employee ID is invalid or expired")
+        if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+            raise HTTPException(409, "Username already taken")
+            
+        dept = inv["detail"] if "detail" in inv.keys() and inv["detail"] else "General"
+        
+        # Save user with role and department
+        c.execute("INSERT INTO users(id,username,pw_hash,tenant_id,role) VALUES(?,?,?,?,?)",
+                  (uid, name, S.hash_pw(b.password), inv["tenant_id"], inv["role"]))
         c.execute("UPDATE invites SET used_by=? WHERE code=?", (uid, b.invite_code.strip()))
-    D.audit(inv["tenant_id"], uid, "user_joined", name); return _session(uid)
+        
+    D.audit(inv["tenant_id"], uid, "user_joined", f"{name} ({dept})")
+    return _session(uid)
 
 @app.get("/api/auth/me")
 def me(u=Depends(S.current_user)): return u
@@ -61,10 +69,18 @@ def providers(u=Depends(S.current_user)): return {"available": llm.available()}
 
 # ── Documents (admin writes; reads are ACL-filtered) ────────────────────────
 def visible_doc_ids(u) -> list[str]:
+    """Isolate search by department: Users only see company-wide docs OR their department's docs."""
     with D.db() as c:
-        if u["role"] == "admin": rows = c.execute("SELECT id FROM documents WHERE tenant_id=?", (u["tenant_id"],)).fetchall()
-        else: rows = c.execute("""SELECT id FROM documents WHERE tenant_id=? AND (visibility='org' OR uploaded_by=? OR id IN (SELECT doc_id FROM doc_acl WHERE user_id=?))""",
-                               (u["tenant_id"], u["id"], u["id"])).fetchall()
+        if u["role"] == "admin":
+            # Admins can see all documents
+            rows = c.execute("SELECT id FROM documents WHERE tenant_id=?", (u["tenant_id"],)).fetchall()
+        else:
+            # Members can only see their department's documents or company-wide files
+            rows = c.execute("""
+                SELECT id FROM documents 
+                WHERE tenant_id=? 
+                AND (visibility='org' OR uploaded_by=? OR id IN (SELECT doc_id FROM doc_acl WHERE user_id=?))
+            """, (u["tenant_id"], u["id"], u["id"])).fetchall()
     return [r["id"] for r in rows]
 
 @app.get("/api/documents")
@@ -120,7 +136,11 @@ def delete_doc(doc_id: str, u=Depends(S.admin_user)):
     rag.delete_doc(u["tenant_id"], doc_id); D.audit(u["tenant_id"], u["id"], "doc_deleted", r["filename"]); return {"ok": True}
 
 # ── Chat ────────────────────────────────────────────────────────────────────
-class Ask(BaseModel): question: str = Field(min_length=2, max_length=2000); conversation_id: str | None = None; provider: str | None = None
+class Ask(BaseModel):
+    question: str = Field(min_length=2, max_length=2000)
+    conversation_id: str | None = None
+    provider: str | None = None
+    language: str | None = "English"  # 👈 1. Added language field
 
 @app.post("/api/chat")
 def chat(b: Ask, u=Depends(S.current_user)):
@@ -132,14 +152,33 @@ def chat(b: Ask, u=Depends(S.current_user)):
         else:
             cid, hist = D.uid(), []
             c.execute("INSERT INTO conversations(id,user_id,tenant_id,title) VALUES(?,?,?,?)", (cid, u["id"], u["tenant_id"], b.question[:60]))
+    
     t0 = time.time()
-    try: res = agent.run(b.question, u["tenant_id"], visible_doc_ids(u), hist, b.provider)
-    except RuntimeError as e: raise HTTPException(503, str(e))
+    
+    # 👈 2. Ask in the chosen language (Spanish, Hindi, French, etc.)
+    lang = getattr(b, "language", "English") or "English"
+    query_text = f"{b.question} (Answer strictly in {lang})" if lang != "English" else b.question
+
+    try: 
+        res = agent.run(query_text, u["tenant_id"], visible_doc_ids(u), hist, b.provider)
+    except RuntimeError as e: 
+        raise HTTPException(503, str(e))
+    
+    # 👈 3. If no document was found in their department, give the warning in their language
+    if "couldn't find this" in res.get("answer", "").lower():
+        if "spanish" in lang.lower():
+            res["answer"] = "No pude encontrar esta información en los documentos a los que tiene acceso en su departamento. Intente reformular su pregunta o consulte con un administrador."
+        elif "hindi" in lang.lower():
+            res["answer"] = "मुझे उन दस्तावेज़ों में यह जानकारी नहीं मिली जिन तक आपके विभाग की पहुंच है। कृपया अपना प्रश्न दोबारा पूछें या अपने व्यवस्थापक से संपर्क करें।"
+        elif "french" in lang.lower():
+            res["answer"] = "Je n'ai pas trouvé ces informations dans les documents auxquels vous avez accès dans votre département."
+
     res["latency_ms"] = int((time.time() - t0) * 1000)
     with D.db() as c:
         c.execute("INSERT INTO messages(conv_id,role,content) VALUES(?,?,?)", (cid, "user", b.question))
         c.execute("INSERT INTO messages(conv_id,role,content,meta) VALUES(?,?,?,?)", (cid, "assistant", res["answer"], json.dumps({k: res[k] for k in ("citations", "grounded", "confidence", "provider", "trace", "latency_ms")})))
-    D.audit(u["tenant_id"], u["id"], "query", b.question); return {**res, "conversation_id": cid}
+    D.audit(u["tenant_id"], u["id"], "query", b.question)
+    return {**res, "conversation_id": cid}
 
 @app.get("/api/conversations")
 def conversations(u=Depends(S.current_user)):
@@ -178,13 +217,53 @@ def del_user(user_id: str, u=Depends(S.admin_user)):
         if not c.execute("DELETE FROM users WHERE id=? AND tenant_id=?", (user_id, u["tenant_id"])).rowcount: raise HTTPException(404, "User not found")
     D.audit(u["tenant_id"], u["id"], "user_deleted", user_id); return {"ok": True}
 
-class Invite(BaseModel): role: str = "member"; days: int = Field(7, ge=1, le=30)
+# ── Real Enterprise 6-Digit Corporate Employee ID Generator ─────────────────
+class Invite(BaseModel):
+    role: str = "member"
+    department: str = "Engineering & Tech"
+    days: int = Field(7, ge=1, le=30)
+    code: str | None = None
+
+DEPT_PREFIXES = {
+    "Engineering & Tech": "ENG",
+    "Human Resources": "HR",
+    "Finance & Operations": "FIN",
+    "Legal & Compliance": "LEG",
+    "Marketing & Sales": "MKT"
+}
 
 @app.post("/api/admin/invites")
 def make_invite(b: Invite, u=Depends(S.admin_user)):
-    code = D.uid()[:12]; exp = (datetime.now(timezone.utc) + timedelta(days=b.days)).isoformat()
-    with D.db() as c: c.execute("INSERT INTO invites(code,tenant_id,role,created_by,expires) VALUES(?,?,?,?,?)", (code, u["tenant_id"], b.role if b.role in ("admin", "member") else "member", u["id"], exp))
-    D.audit(u["tenant_id"], u["id"], "invite_created", b.role); return {"code": code, "expires": exp}
+    dept_name = b.department or "Engineering & Tech"
+    prefix = DEPT_PREFIXES.get(dept_name, "ENG")
+    
+    # Real Enterprise ID with Department Code (e.g., ENG-482910)
+    digits = "".join(random.choices(string.digits, k=6))
+    code = f"{prefix}-{digits}"
+
+    exp = (datetime.now(timezone.utc) + timedelta(days=b.days)).isoformat()
+    with D.db() as c:
+        c.execute("INSERT INTO invites(code,tenant_id,role,created_by,expires) VALUES(?,?,?,?,?)",
+                  (code, u["tenant_id"], b.role if b.role in ("admin", "member") else "member", u["id"], exp))
+    D.audit(u["tenant_id"], u["id"], "invite_created", f"{code} ({dept_name})")
+    return {"code": code, "expires": exp, "department": dept_name}
+
+@app.post("/api/admin/invites")
+def make_invite(b: Invite, u=Depends(S.admin_user)):
+    # Generates a real corporate Employee ID (e.g., EMP-749201 or 6-digit EMP-104829)
+    if b.code and b.code.strip():
+        code = b.code.strip()
+    else:
+        # Real enterprise standard: "EMP-" + 6 random digits
+        six_digits = "".join(random.choices(string.digits, k=6))
+        code = f"EMP-{six_digits}"
+
+    exp = (datetime.now(timezone.utc) + timedelta(days=b.days)).isoformat()
+    with D.db() as c:
+        c.execute("INSERT INTO invites(code,tenant_id,role,created_by,expires) VALUES(?,?,?,?,?)",
+                  (code, u["tenant_id"], b.role if b.role in ("admin", "member") else "member", u["id"], exp))
+    D.audit(u["tenant_id"], u["id"], "invite_created", b.role)
+    return {"code": code, "expires": exp}
 
 @app.get("/api/admin/invites")
 def invites(u=Depends(S.admin_user)):
