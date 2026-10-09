@@ -13,4 +13,3 @@ if (container) {
     </StrictMode>
   );
 }
-
