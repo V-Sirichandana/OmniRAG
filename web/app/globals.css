@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   OmniRAG design tokens — premium dark UI with indigo/purple accents
+--------------------------------------------------------------------------- */
+@theme {
+  --color-ink: #070b14; /* page background            */
+  --color-ink-2: #0a101d; /* raised background          */
+  --color-panel: #0e1526; /* card / panel background    */
+  --color-panel-2: #121b30; /* hover / nested panel       */
+  --color-line: #1d2842; /* borders                    */
+  --color-line-2: #2b3b60; /* stronger borders           */
+  --color-brand: #4f46e5; /* indigo-600 primary         */
+  --color-brand-2: #6366f1; /* indigo-500                 */
+  --color-accent: #7c3aed; /* purple accent              */
+  --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
+    "Liberation Mono", monospace;
+}
+
+@layer base {
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    background-color: var(--color-ink);
+    color: #cbd5e1;
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection {
+    background: rgba(99, 102, 241, 0.35);
+    color: #fff;
+  }
+  input,
+  select,
+  textarea,
+  button {
+    font: inherit;
+  }
+  /* dark, slim scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #2b3b60 transparent;
+  }
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: #2b3b60;
+    border-radius: 8px;
+  }
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer utilities {
+  /* subtle radial glow used behind the login card */
+  .glow-bg {
+    background:
+      radial-gradient(900px 500px at 15% -10%, rgba(79, 70, 229, 0.18), transparent 60%),
+      radial-gradient(800px 500px at 90% 110%, rgba(124, 58, 237, 0.14), transparent 60%),
+      var(--color-ink);
+  }
+  .panel {
+    background-color: var(--color-panel);
+    border: 1px solid var(--color-line);
+    border-radius: 1rem;
+  }
+  .text-muted {
+    color: #94a3b8;
+  }
+}
