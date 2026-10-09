@@ -1,8 +1,9 @@
 "use client";
 
 /**
- * Departments — organization structure. Each department scopes document
- * visibility; admins can create and remove departments.
+ * Departments — organization structure under strict department isolation.
+ * Members only ever see their OWN department; admins see all of them to
+ * manage people, but document access stays department-locked for everyone.
  */
 import { useCallback, useEffect, useState } from "react";
 import { Building2, FileText, Plus, Trash2, Users } from "lucide-react";
@@ -72,8 +73,9 @@ export default function DepartmentsPage() {
         <div>
           <h1 className="text-xl font-bold text-white">Departments</h1>
           <p className="mt-1 text-sm text-muted">
-            Department membership controls which restricted documents a member can
-            retrieve. Every check is enforced on the backend.
+            {isAdmin
+              ? "Manage organization structure. Documents inside each department are visible only to that department — for every role."
+              : `You belong to ${user?.department || "—"} — it is the only department and the only set of documents you can see.`}
           </p>
         </div>
         {isAdmin && (
@@ -126,58 +128,74 @@ export default function DepartmentsPage() {
         </div>
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {depts.map((d) => (
-            <div
-              key={d.id}
-              className="panel group flex flex-col p-5 transition hover:border-line-2"
-            >
-              <div className="flex items-start justify-between gap-3">
-                <div className="flex items-center gap-3">
-                  <span className="grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-brand/25 to-accent/25 ring-1 ring-brand/30">
-                    <Building2 size={20} className="text-indigo-300" />
-                  </span>
-                  <div>
-                    <h3 className="font-semibold leading-tight text-white">{d.name}</h3>
-                    <Badge tone="indigo" className="mt-1 font-mono">
-                      {d.code}
-                    </Badge>
+          {depts.map((d) => {
+            const mine = d.name === user?.department;
+            return (
+              <div
+                key={d.id}
+                className="panel group flex flex-col p-5 transition hover:border-line-2"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-center gap-3">
+                    <span className="grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-brand/25 to-accent/25 ring-1 ring-brand/30">
+                      <Building2 size={20} className="text-indigo-300" />
+                    </span>
+                    <div>
+                      <h3 className="font-semibold leading-tight text-white">{d.name}</h3>
+                      <div className="mt-1 flex items-center gap-1.5">
+                        <Badge tone="indigo" className="font-mono">
+                          {d.code}
+                        </Badge>
+                        {mine && <Badge tone="emerald">Your department</Badge>}
+                      </div>
+                    </div>
                   </div>
+                  {isAdmin && (
+                    <button
+                      onClick={() => void removeDept(d)}
+                      title="Delete department"
+                      className="rounded-lg p-2 text-slate-600 opacity-0 transition hover:bg-red-500/10 hover:text-red-400 group-hover:opacity-100"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  )}
                 </div>
-                {isAdmin && (
-                  <button
-                    onClick={() => void removeDept(d)}
-                    title="Delete department"
-                    className="rounded-lg p-2 text-slate-600 opacity-0 transition hover:bg-red-500/10 hover:text-red-400 group-hover:opacity-100"
+
+                <div className="mt-5 flex items-center gap-4 text-xs text-muted">
+                  <span className="flex items-center gap-1.5">
+                    <FileText size={13} className="text-brand-2" />
+                    {d.documents} document{d.documents === 1 ? "" : "s"}
+                  </span>
+                  <span className="flex items-center gap-1.5">
+                    <Users size={13} className="text-accent" />
+                    {d.members} member{d.members === 1 ? "" : "s"}
+                  </span>
+                </div>
+
+                {mine ? (
+                  <a
+                    href="/library"
+                    className="mt-4 border-t border-line pt-3 text-xs font-medium text-indigo-400 transition hover:text-indigo-300"
                   >
-                    <Trash2 size={15} />
-                  </button>
+                    View department documents →
+                  </a>
+                ) : (
+                  <p className="mt-4 border-t border-line pt-3 text-[11px] leading-relaxed text-slate-600">
+                    Only {d.name} members can see this department&apos;s documents.
+                  </p>
                 )}
               </div>
-
-              <div className="mt-5 flex items-center gap-4 text-xs text-muted">
-                <span className="flex items-center gap-1.5">
-                  <FileText size={13} className="text-brand-2" />
-                  {d.documents} document{d.documents === 1 ? "" : "s"}
-                </span>
-                <span className="flex items-center gap-1.5">
-                  <Users size={13} className="text-accent" />
-                  {d.members} member{d.members === 1 ? "" : "s"}
-                </span>
-              </div>
-
-              <a
-                href={`/library?dept=${encodeURIComponent(d.name)}`}
-                className="mt-4 border-t border-line pt-3 text-xs font-medium text-indigo-400 transition hover:text-indigo-300"
-              >
-                View department documents →
-              </a>
-            </div>
-          ))}
+            );
+          })}
         </div>
       )}
 
       {!loading && depts.length === 0 && (
-        <p className="mt-8 text-sm text-slate-500">No departments yet.</p>
+        <p className="mt-8 text-sm text-slate-500">
+          {isAdmin
+            ? "No departments yet."
+            : "You are not assigned to a department — ask an administrator to place you."}
+        </p>
       )}
     </div>
   );

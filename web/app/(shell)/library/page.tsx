@@ -1,8 +1,11 @@
 "use client";
 
 /**
- * Document Library — upload & index, department filters, access control and
- * the indexed document list (with download/delete for admins).
+ * Document Library — upload & index with strict department isolation.
+ *
+ * Every document belongs to exactly one department and is visible ONLY to
+ * that department (admins included). "Restricted" narrows access to an
+ * explicit allowlist *within* the department.
  */
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useSearchParams } from "next/navigation";
@@ -10,8 +13,8 @@ import {
   Building2,
   Download,
   FileText,
-  Globe2,
   Lock,
+  ShieldAlert,
   Trash2,
   UploadCloud,
 } from "lucide-react";
@@ -23,10 +26,29 @@ import { Badge, Btn, ErrorNote, Field, Panel, formatDate, inputCls } from "@/com
 const ACCEPT = ".pdf,.docx,.pptx,.txt,.md,.csv,.json";
 const MAX_MB = 4; // Vercel request body limit is 4.5 MB
 
-const VIS_META: Record<Visibility, { label: string; icon: typeof Globe2; tone: "emerald" | "indigo" | "amber"; cls: string }> = {
-  org: { label: "Org-wide", icon: Globe2, tone: "emerald", cls: "bg-emerald-500/10 text-emerald-300 ring-emerald-500/30" },
-  department: { label: "Department", icon: Building2, tone: "indigo", cls: "bg-indigo-500/10 text-indigo-300 ring-indigo-500/30" },
-  restricted: { label: "Restricted", icon: Lock, tone: "amber", cls: "bg-amber-500/10 text-amber-300 ring-amber-500/30" },
+const VIS_META: Record<
+  Visibility,
+  { label: string; icon: typeof Building2; tone: "indigo" | "amber"; cls: string }
+> = {
+  // legacy alias: "org" behaves exactly like "department" (never crosses depts)
+  org: {
+    label: "Department",
+    icon: Building2,
+    tone: "indigo",
+    cls: "bg-indigo-500/10 text-indigo-300 ring-indigo-500/30",
+  },
+  department: {
+    label: "Department",
+    icon: Building2,
+    tone: "indigo",
+    cls: "bg-indigo-500/10 text-indigo-300 ring-indigo-500/30",
+  },
+  restricted: {
+    label: "Restricted",
+    icon: Lock,
+    tone: "amber",
+    cls: "bg-amber-500/10 text-amber-300 ring-amber-500/30",
+  },
 };
 
 function LibraryPage() {
@@ -39,17 +61,19 @@ function LibraryPage() {
   const [users, setUsers] = useState<AdminUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
-  const [filter, setFilter] = useState<string>(search.get("dept") ?? "All");
 
   // upload form state
   const [file, setFile] = useState<File | null>(null);
-  const [dept, setDept] = useState(search.get("dept") && search.get("dept") !== "All" ? search.get("dept")! : "");
-  const [vis, setVis] = useState<Visibility>("org");
+  const [dept, setDept] = useState(search.get("dept") ?? "");
+  const [vis, setVis] = useState<Visibility>("department");
   const [allowed, setAllowed] = useState<string[]>([]);
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
   const inputRef = useRef<HTMLInputElement>(null);
+
+  const myDept = user?.department ?? "";
+  const targetDept = dept || myDept; // where a new upload would land
 
   const load = useCallback(() => {
     api
@@ -89,10 +113,11 @@ function LibraryPage() {
       const fd = new FormData();
       fd.append("file", file);
       fd.append("visibility", vis);
-      fd.append("department", dept);
+      fd.append("department", targetDept);
       fd.append("allowed_user_ids", allowed.join(","));
       await api.upload("/api/documents", fd);
       setFile(null);
+      setAllowed([]);
       if (inputRef.current) inputRef.current.value = "";
       load();
       window.dispatchEvent(new Event("omnirag:changed"));
@@ -132,8 +157,11 @@ function LibraryPage() {
     }
   }
 
-  const filtered = docs.filter((d) => filter === "All" || d.department === filter);
-  const filterOptions = ["All", ...depts.map((d) => d.name)];
+  // same-department users are the only possible recipients of a grant
+  const deptUsers = users.filter((u) => u.id !== user?.id && u.department === targetDept);
+  const deptOptions = depts.some((d) => d.name === myDept) || !myDept
+    ? depts
+    : [...depts, { id: "__mine", name: myDept, code: "", created: "", documents: 0, members: 0 }];
 
   return (
     <div className="mx-auto max-w-6xl px-5 py-8 sm:px-8">
@@ -141,30 +169,21 @@ function LibraryPage() {
       <div className="mb-6">
         <h1 className="text-xl font-bold text-white">Document Library</h1>
         <p className="mt-1 text-sm text-muted">
-          {user?.tenant_name} ({isAdmin ? "Administrator" : "Member"} oversight) · indexed
-          knowledge with per-document access control
+          {user?.tenant_name} · strict department isolation — every file, answer and
+          citation stays inside its own department.
         </p>
       </div>
 
-      {/* department filter */}
-      <div className="mb-5 flex flex-wrap items-center gap-2">
-        <span className="mr-1 text-xs font-medium text-slate-500">
-          {isAdmin ? "Administrator" : ""} Department Filter:
+      {/* scope row: everyone sees exactly one department */}
+      <div className="mb-5 flex flex-wrap items-center gap-3 text-xs">
+        <Badge tone="indigo">
+          <Building2 size={11} /> Your department: {myDept || "—"}
+        </Badge>
+        <span className="text-slate-500">
+          {isAdmin
+            ? "Even administrators only see files of their own department."
+            : "Only your department's files are listed — nothing else is accessible."}
         </span>
-        {filterOptions.map((f) => (
-          <button
-            key={f}
-            onClick={() => setFilter(f)}
-            className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
-              filter === f
-                ? "border-brand bg-brand text-white"
-                : "border-line bg-panel text-slate-400 hover:border-line-2 hover:text-white"
-            }`}
-          >
-            {f}
-          </button>
-        ))}
-        <span className="ml-auto text-xs text-slate-500">Viewing: {filter}</span>
       </div>
 
       <ErrorNote>{error}</ErrorNote>
@@ -175,7 +194,7 @@ function LibraryPage() {
           className="mb-6"
           icon={UploadCloud}
           title="Upload & Index New Document"
-          subtitle="PDF · DOCX · PPTX · TXT · MD · CSV · JSON"
+          subtitle="PDF · DOCX · PPTX · TXT · MD · CSV · JSON — always filed into one department"
         >
           <form onSubmit={uploadFile} className="space-y-4">
             <div
@@ -219,15 +238,20 @@ function LibraryPage() {
             </div>
 
             <div className="grid gap-4 sm:grid-cols-2">
-              <Field label="Department">
+              <Field label="Department (required)" hint="Files are only ever visible inside this department.">
                 <select
                   className={inputCls}
-                  value={dept}
-                  onChange={(e) => setDept(e.target.value)}
-                  required={vis === "department"}
+                  value={targetDept}
+                  onChange={(e) => {
+                    setDept(e.target.value);
+                    setAllowed([]);
+                  }}
+                  required
                 >
-                  <option value="">Select department…</option>
-                  {depts.map((d) => (
+                  <option value="" disabled>
+                    Select department…
+                  </option>
+                  {deptOptions.map((d) => (
                     <option key={d.id} value={d.name}>
                       {d.name}
                     </option>
@@ -239,8 +263,7 @@ function LibraryPage() {
                 <div className="flex overflow-hidden rounded-lg border border-line">
                   {(
                     [
-                      { id: "org", label: "Whole Org", icon: Globe2 },
-                      { id: "department", label: "Department", icon: Building2 },
+                      { id: "department", label: "Whole Department", icon: Building2 },
                       { id: "restricted", label: "Restricted", icon: Lock },
                     ] as const
                   ).map((v) => (
@@ -261,12 +284,29 @@ function LibraryPage() {
               </Field>
             </div>
 
+            {targetDept && targetDept !== myDept && (
+              <p className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                <ShieldAlert size={14} className="mt-0.5 shrink-0" />
+                <span>
+                  This file belongs to <strong>{targetDept}</strong>. Because isolation is
+                  strict, <u>you won&apos;t see it yourself</u> — it is for that
+                  department&apos;s members only.
+                </span>
+              </p>
+            )}
+
             {vis === "restricted" && (
-              <Field label="Grant access to" hint="Only these users will be able to retrieve this document.">
+              <Field
+                label="Grant access to"
+                hint="Only these members (of the same department) can retrieve this document."
+              >
                 <div className="max-h-40 space-y-1 overflow-y-auto rounded-lg border border-line bg-ink-2 p-2">
-                  {users
-                    .filter((u) => u.id !== user?.id)
-                    .map((u) => (
+                  {deptUsers.length === 0 ? (
+                    <p className="px-2 py-1 text-xs text-slate-500">
+                      No other members in {targetDept || "this department"} yet.
+                    </p>
+                  ) : (
+                    deptUsers.map((u) => (
                       <label
                         key={u.id}
                         className="flex cursor-pointer items-center gap-2 rounded px-2 py-1.5 text-xs text-slate-300 hover:bg-panel-2"
@@ -284,7 +324,8 @@ function LibraryPage() {
                         {u.username}
                         <span className="text-slate-500">· {u.department}</span>
                       </label>
-                    ))}
+                    ))
+                  )}
                 </div>
               </Field>
             )}
@@ -300,14 +341,10 @@ function LibraryPage() {
         </Panel>
       )}
 
-      {/* indexed documents */}
+      {/* indexed documents — already scoped server-side to the caller's department */}
       <Panel
-        title={`Indexed Documents (${filtered.length})`}
-        subtitle={
-          filter === "All"
-            ? "All documents you are authorized to see"
-            : `Filtered to ${filter}`
-        }
+        title={`Indexed Documents (${docs.length})`}
+        subtitle={`Scoped to ${myDept || "your department"}`}
         icon={FileText}
         bodyClassName="p-0"
       >
@@ -317,16 +354,16 @@ function LibraryPage() {
               <div key={i} className="h-16 animate-pulse rounded-xl bg-panel-2/60" />
             ))}
           </div>
-        ) : filtered.length === 0 ? (
+        ) : docs.length === 0 ? (
           <p className="px-5 py-10 text-center text-sm text-slate-500">
             {isAdmin
-              ? "No documents indexed yet — upload your first document above."
+              ? "No documents in your department yet — upload your first document above."
               : "No documents are visible to you yet."}
           </p>
         ) : (
           <ul className="divide-y divide-line">
-            {filtered.map((d) => {
-              const meta = VIS_META[d.visibility] ?? VIS_META.org;
+            {docs.map((d) => {
+              const meta = VIS_META[d.visibility] ?? VIS_META.department;
               const Icon = meta.icon;
               return (
                 <li

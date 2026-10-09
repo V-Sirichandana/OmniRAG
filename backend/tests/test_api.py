@@ -91,6 +91,13 @@ def test_signup_org_a():
     assert u["tenant_name"] == "Acme Corporation"
     assert u["employee_id"] == "ORG-ADMIN"
     assert u["department"] == "General"
+    # Strict department isolation: everyone only ever sees their own
+    # department, so the admin works inside Human Resources for this suite.
+    r = client.patch(f"/api/admin/users/{u['id']}", headers=auth(s["token"]),
+                     json={"department": "Human Resources"})
+    assert r.status_code == 200
+    assert client.get("/api/auth/me", headers=auth(s["token"])) \
+                  .json()["department"] == "Human Resources"
 
 
 @test
@@ -115,14 +122,15 @@ def test_departments_seeded():
 
 
 @test
-def test_upload_txt_org_wide():
+def test_upload_txt_document():
     txt = ("Employee Handbook\n\nParental leave allowance is twenty-four weeks "
            "for all full-time employees. Casual leave is twelve days per year.\n")
     r = upload(STATE["acme"]["token"], "Handbook.txt", txt,
                visibility="org", department="Human Resources")
     assert r.status_code == 200, r.text
     doc = r.json()
-    assert doc["chunks"] > 0 and doc["visibility"] == "org"
+    assert doc["chunks"] > 0 and doc["visibility"] == "department"
+    # "org" visibility is an alias: it never crosses department lines
     STATE["handbook"] = doc
 
     docs = client.get("/api/documents", headers=auth(STATE["acme"]["token"])).json()
@@ -174,6 +182,9 @@ def test_invite_and_register_hr_member():
     assert reg.json()["user"]["department"] == "Human Resources"
     assert reg.json()["user"]["employee_id"] == code
     assert reg.json()["user"]["role"] == "member"
+    # a member's department list contains ONLY their own department
+    depts = client.get("/api/departments", headers=auth(reg.json()["token"])).json()
+    assert [d["name"] for d in depts] == ["Human Resources"]
 
 
 @test
@@ -185,10 +196,11 @@ def test_invite_reuse_rejected():
 
 
 @test
-def test_member_sees_org_docs():
+def test_member_sees_only_own_department_docs():
     docs = client.get("/api/documents", headers=auth(STATE["hr"]["token"])).json()
     names = {d["filename"] for d in docs}
-    assert "Handbook.txt" in names and "Standard.docx" in names
+    assert "Handbook.txt" in names           # own department (Human Resources)
+    assert "Standard.docx" not in names      # never Engineering & Tech
     # members must NOT see admin-only fields like allowed_user_ids
     assert all("allowed_user_ids" not in d for d in docs)
 
@@ -206,9 +218,9 @@ def test_department_visibility_isolation():
     docs = client.get("/api/documents", headers=auth(STATE["hr"]["token"])).json()
     assert "Payroll.txt" not in {d["filename"] for d in docs}
 
-    # admin sees it
+    # strict isolation: even the admin (Human Resources) cannot see Finance files
     docs = client.get("/api/documents", headers=auth(STATE["acme"]["token"])).json()
-    assert "Payroll.txt" in {d["filename"] for d in docs}
+    assert "Payroll.txt" not in {d["filename"] for d in docs}
 
     # a Finance member WOULD see it
     inv = client.post("/api/admin/invites", headers=auth(STATE["acme"]["token"]),
@@ -219,22 +231,40 @@ def test_department_visibility_isolation():
     STATE["fin"] = fin
     docs = client.get("/api/documents", headers=auth(fin["token"])).json()
     assert "Payroll.txt" in {d["filename"] for d in docs}
-    assert "Handbook.txt" in {d["filename"] for d in docs}   # org-wide still visible
+    # an HR document never crosses over to Finance, no matter its visibility
+    assert "Handbook.txt" not in {d["filename"] for d in docs}
 
 
 @test
 def test_restricted_visibility_acl():
+    t = auth(STATE["acme"]["token"])
+    # two Legal & Compliance members: one granted, one not
+    codes = []
+    for who in ("lena_leg", "leo_leg"):
+        inv = client.post("/api/admin/invites", headers=t,
+                          json={"role": "member", "department": "Legal & Compliance"})
+        reg = client.post("/api/auth/register",
+                          json={"username": who, "password": "legpass123",
+                                "invite_code": inv.json()["code"]})
+        assert reg.status_code == 200, reg.text
+        codes.append(reg.json())
+    lena, leo = codes
+
     r = upload(STATE["acme"]["token"], "BoardSecrets.txt",
                "The acquisition target is Globex. Offer ceiling is 400 million.",
                visibility="restricted", department="Legal & Compliance",
-               allowed=STATE["fin"]["user"]["id"])
+               allowed=lena["user"]["id"])
     assert r.status_code == 200, r.text
     STATE["secrets"] = r.json()
 
-    docs = client.get("/api/documents", headers=auth(STATE["hr"]["token"])).json()
-    assert "BoardSecrets.txt" not in {d["filename"] for d in docs}
-    docs = client.get("/api/documents", headers=auth(STATE["fin"]["token"])).json()
-    assert "BoardSecrets.txt" in {d["filename"] for d in docs}
+    def names(tok):
+        return {d["filename"] for d in
+                client.get("/api/documents", headers=auth(tok)).json()}
+
+    assert "BoardSecrets.txt" in names(lena["token"])     # granted, same dept
+    assert "BoardSecrets.txt" not in names(leo["token"])  # same dept, NOT granted
+    assert "BoardSecrets.txt" not in names(STATE["hr"]["token"])   # other dept
+    assert "BoardSecrets.txt" not in names(STATE["fin"]["token"])  # other dept
 
 
 @test
@@ -301,7 +331,7 @@ def test_download_roundtrip():
     assert dl.status_code == 200
     assert dl.content == original.encode()
     assert "Down.txt" in dl.headers.get("content-disposition", "")
-    # another member can download org-wide docs too
+    # a member of the same department can download it too
     dl2 = client.get(f"/api/documents/{did}/download",
                      headers=auth(STATE["hr"]["token"]))
     assert dl2.status_code == 200
@@ -310,13 +340,22 @@ def test_download_roundtrip():
 
 @test
 def test_delete_doc_removes_chunks():
-    doc_id = STATE["payroll"]["id"]
     tid = STATE["acme"]["user"]["tenant_id"]
+    # strict: the admin cannot delete another department's document (404)
+    r = client.delete(f"/api/documents/{STATE['payroll']['id']}",
+                      headers=auth(STATE["acme"]["token"]))
+    assert r.status_code == 404
+
+    # delete a document of the admin's own department
+    r = upload(STATE["acme"]["token"], "Scrap.txt",
+               "Temporary notes about bonus pool percent changes.")
+    assert r.status_code == 200, r.text
+    doc_id = r.json()["id"]
     assert rag.search(tid, [doc_id], "bonus pool percent")
     r = client.delete(f"/api/documents/{doc_id}", headers=auth(STATE["acme"]["token"]))
     assert r.status_code == 200
     assert rag.search(tid, [doc_id], "bonus pool percent") == []
-    # members can't delete
+    # members can't delete anything
     r = client.delete(f"/api/documents/{STATE['handbook']['id']}",
                       headers=auth(STATE["hr"]["token"]))
     assert r.status_code == 403
@@ -336,7 +375,7 @@ def test_admin_users_list_and_updates():
     r = client.get("/api/admin/users", headers=auth(STATE["acme"]["token"]))
     assert r.status_code == 200
     users = {u["username"]: u for u in r.json()}
-    assert set(users) == {"acme_admin", "hana_hr", "fin_user"}
+    assert {"acme_admin", "hana_hr", "fin_user"} <= set(users)
     assert users["fin_user"]["department"] == "Finance & Operations"
 
     fin_id = users["fin_user"]["id"]
@@ -397,7 +436,7 @@ def test_department_crud():
 def test_admin_stats_and_audit():
     t = auth(STATE["acme"]["token"])
     stats = client.get("/api/admin/stats", headers=t).json()
-    assert stats["users"] == 3 and stats["documents"] >= 3 and stats["queries"] == 0
+    assert stats["users"] >= 3 and stats["documents"] >= 3 and stats["queries"] == 0
     audit = client.get("/api/admin/audit", headers=t).json()
     actions = {a["action"] for a in audit}
     assert {"org_created", "login", "doc_uploaded", "invite_created",

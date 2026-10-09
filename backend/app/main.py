@@ -111,25 +111,21 @@ def providers(u=Depends(S.current_user)):
 
 # ── Documents (admin writes; reads are ACL- and department-filtered) ────────
 def visible_doc_ids(u) -> list[str]:
-    """Tenant + department + per-document ACL isolation.
+    """Strict department isolation — applied identically to admins and members.
 
-    * admins see everything inside their own organization;
-    * members see org-wide docs, their own department's docs, docs they
-      uploaded, and docs explicitly shared with them.
+    A document is visible only when it belongs to the caller's own
+    department. 'restricted' documents additionally require an explicit
+    ACL grant. Nothing crosses department lines: no role (not even admin)
+    sees another department's sources, documents, or citations.
     """
     with D.db() as c:
-        if u["role"] == "admin":
-            rows = c.execute("SELECT id FROM documents WHERE tenant_id=?", (u["tenant_id"],)).fetchall()
-        else:
-            rows = c.execute(
-                """SELECT id FROM documents
-                   WHERE tenant_id=?
-                     AND (visibility='org'
-                          OR (visibility='department' AND department=?)
-                          OR uploaded_by=?
-                          OR id IN (SELECT doc_id FROM doc_acl WHERE user_id=?))""",
-                (u["tenant_id"], u.get("department") or "", u["id"], u["id"]),
-            ).fetchall()
+        rows = c.execute(
+            """SELECT id FROM documents
+               WHERE tenant_id=? AND department=?
+                 AND (visibility!='restricted'
+                      OR id IN (SELECT doc_id FROM doc_acl WHERE user_id=?))""",
+            (u["tenant_id"], u.get("department") or "", u["id"]),
+        ).fetchall()
     return [r["id"] for r in rows]
 
 
@@ -193,8 +189,10 @@ async def upload(
         raise HTTPException(400, f"Unsupported type. Allowed: {', '.join(sorted(ALLOWED_EXT))}")
     if visibility not in VISIBILITIES:
         raise HTTPException(400, f"visibility must be one of {', '.join(VISIBILITIES)}")
-    if visibility == "department" and not department.strip():
-        raise HTTPException(400, "department is required for department visibility")
+    # Strict department isolation: 'org' is kept as an API alias but behaves
+    # exactly like 'department' — nothing is visible outside its department.
+    visibility = "department" if visibility == "org" else visibility
+    department = department.strip() or (u.get("department") or "").strip() or "General"
     data = await file.read()
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB} MB")
@@ -248,23 +246,28 @@ class Acl(BaseModel):
 def set_access(doc_id: str, b: Acl, u=Depends(S.admin_user)):
     if b.visibility not in VISIBILITIES:
         raise HTTPException(400, f"visibility must be one of {', '.join(VISIBILITIES)}")
+    visibility = "department" if b.visibility == "org" else b.visibility
+    # department-scoped: only documents of the caller's own department
+    if doc_id not in visible_doc_ids(u):
+        raise HTTPException(404, "Document not found")
     with D.db() as c:
-        if not c.execute("SELECT 1 FROM documents WHERE id=? AND tenant_id=?",
-                         (doc_id, u["tenant_id"])).fetchone():
-            raise HTTPException(404, "Document not found")
-        c.execute("UPDATE documents SET visibility=? WHERE id=?", (b.visibility, doc_id))
-        _set_acl(c, doc_id, u["tenant_id"], b.allowed_user_ids if b.visibility == "restricted" else [])
-    D.audit(u["tenant_id"], u["id"], "doc_access_changed", f"{doc_id}→{b.visibility}")
+        c.execute("UPDATE documents SET visibility=? WHERE id=?", (visibility, doc_id))
+        _set_acl(c, doc_id, u["tenant_id"], b.allowed_user_ids if visibility == "restricted" else [])
+    D.audit(u["tenant_id"], u["id"], "doc_access_changed", f"{doc_id}→{visibility}")
     return {"ok": True}
 
 
 @app.delete("/api/documents/{doc_id}")
 def delete_doc(doc_id: str, u=Depends(S.admin_user)):
+    # strict department isolation: documents outside the caller's own
+    # department behave exactly like missing documents (404, never a leak)
+    if doc_id not in visible_doc_ids(u):
+        raise HTTPException(404, "Document not found")
     with D.db() as c:
         r = c.execute("SELECT filename FROM documents WHERE id=? AND tenant_id=?",
                       (doc_id, u["tenant_id"])).fetchone()
         if not r:
-            raise HTTPException(404, "Document not found")   # other tenants get 404, never 403-leak
+            raise HTTPException(404, "Document not found")
         c.execute("DELETE FROM documents WHERE id=?", (doc_id,))
     rag.delete_doc(u["tenant_id"], doc_id)
     D.audit(u["tenant_id"], u["id"], "doc_deleted", r["filename"])
@@ -285,7 +288,12 @@ def list_departments(u=Depends(S.current_user)):
                       (SELECT COUNT(*) FROM documents WHERE tenant_id=d.tenant_id AND department=d.name) AS documents,
                       (SELECT COUNT(*) FROM users WHERE tenant_id=d.tenant_id AND department=d.name) AS members
                FROM departments d WHERE d.tenant_id=? ORDER BY d.name""", (u["tenant_id"],)).fetchall()
-    return [dict(r) for r in rows]
+    out = [dict(r) for r in rows]
+    # Members only ever see their own department (admins manage them all).
+    if u["role"] != "admin":
+        mine = (u.get("department") or "").strip()
+        out = [d for d in out if d["name"] == mine]
+    return out
 
 
 @app.post("/api/departments")

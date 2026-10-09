@@ -8,6 +8,8 @@ import type { NextConfig } from "next";
  * service, so no proxy is needed there.
  */
 const nextConfig: NextConfig = {
+  // Hide the floating "N" dev-tools badge that `next dev` shows on localhost.
+  devIndicators: false,
   async rewrites() {
     if (process.env.VERCEL) return [];
     const api = process.env.API_ORIGIN ?? "http://127.0.0.1:8000";

@@ -117,8 +117,8 @@ function AskPage() {
           <div>
             <h1 className="text-xl font-bold text-white">Ask Documents</h1>
             <p className="mt-0.5 text-sm text-muted">
-              Strictly from your organization&apos;s indexed documents — every answer cites
-              its sources.
+              Only from your department&apos;s documents — every answer cites its
+              sources.
             </p>
           </div>
           <div className="flex items-center gap-2">
@@ -166,9 +166,9 @@ function AskPage() {
                 Knowledge ready, {user?.username}
               </h2>
               <p className="mt-1 text-sm text-muted">
-                Ask a question about your indexed documents. Answers include strict,
-                numbered citations — and say so plainly when the information is not
-                there.
+                Ask a question about your department&apos;s indexed documents. Answers
+                include strict, numbered citations — and say so plainly when the
+                information is not there.
               </p>
               <div className="mt-6 space-y-2.5 text-left">
                 {SUGGESTIONS.map((s) => (
@@ -292,7 +292,7 @@ function AskPage() {
           </button>
         </form>
         <p className="mx-auto mt-2 max-w-4xl text-[10px] text-slate-600">
-          Answers are generated only from documents your account can access. Enter to
+          Answers are generated only from documents in your own department. Enter to
           send · Shift+Enter for a new line.
         </p>
       </div>
