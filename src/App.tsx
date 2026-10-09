@@ -303,9 +303,10 @@ export default function App() {
     }
   };
 
-  const loadDocuments = async () => {
+  const loadDocuments = async (deptFilter?: string) => {
     try {
-      const data = await apiCall('GET', '/documents');
+      const queryParam = deptFilter && deptFilter !== 'all' ? `?department_id=${deptFilter}` : '';
+      const data = await apiCall('GET', `/documents${queryParam}`);
       setDocumentsList(data);
     } catch (e) {
       // ignore
@@ -335,6 +336,14 @@ export default function App() {
     setCurrentUser(null);
     setActiveCid(null);
     setMessages([]);
+    setConversations([]);
+    setDocumentsList([]);
+    setDepartmentsList([]);
+    setAdminStats(null);
+    setAdminUsers([]);
+    setAdminInvites([]);
+    setAdminAudit([]);
+    setSelectedDeptFilter('all');
     setActiveTab('ask');
   };
 
@@ -371,6 +380,18 @@ export default function App() {
           department_name: authPrimaryDept,
         });
       }
+
+      // Pristine state initialization on login
+      setActiveCid(null);
+      setMessages([]);
+      setConversations([]);
+      setDocumentsList([]);
+      setDepartmentsList([]);
+      setAdminStats(null);
+      setAdminUsers([]);
+      setAdminInvites([]);
+      setAdminAudit([]);
+
       localStorage.setItem('omnirag_token', res.token);
       setToken(res.token);
       setCurrentUser(res.user);
@@ -825,35 +846,83 @@ export default function App() {
             </button>
           </form>
 
-          <div className="mt-6 pt-5 border-t border-slate-800">
-            <p className="text-[11px] font-semibold text-slate-400 text-center mb-2.5">
-              Demo Accounts
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('signin');
-                  setAuthUsername('admin');
-                  setAuthPassword('password123');
-                }}
-                className="p-2.5 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
-              >
-                <div className="text-xs font-semibold text-indigo-300">Admin (All Depts)</div>
-                <div className="text-[11px] text-slate-400">admin / password123</div>
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  setAuthMode('signin');
-                  setAuthUsername('alice');
-                  setAuthPassword('password123');
-                }}
-                className="p-2.5 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
-              >
-                <div className="text-xs font-semibold text-emerald-300">Alice (Member)</div>
-                <div className="text-[11px] text-slate-400">alice / password123</div>
-              </button>
+          <div className="mt-6 pt-5 border-t border-slate-800 space-y-3">
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5 flex items-center justify-between">
+                <span>Company 1: Acme Corporation</span>
+                <span className="text-[9px] font-mono text-indigo-400">Tenant A</span>
+              </p>
+              <div className="grid grid-cols-3 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setAuthUsername('admin');
+                    setAuthPassword('password123');
+                  }}
+                  className="p-2 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
+                >
+                  <div className="text-[11px] font-semibold text-indigo-300">Admin (All)</div>
+                  <div className="text-[10px] text-slate-400">admin / password123</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setAuthUsername('ravi');
+                    setAuthPassword('password123');
+                  }}
+                  className="p-2 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
+                >
+                  <div className="text-[11px] font-semibold text-sky-300">Ravi (Eng)</div>
+                  <div className="text-[10px] text-slate-400">ravi / password123</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setAuthUsername('sarah');
+                    setAuthPassword('password123');
+                  }}
+                  className="p-2 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
+                >
+                  <div className="text-[11px] font-semibold text-emerald-300">Sarah (HR)</div>
+                  <div className="text-[10px] text-slate-400">sarah / password123</div>
+                </button>
+              </div>
+            </div>
+
+            <div>
+              <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400 mb-1.5 flex items-center justify-between">
+                <span>Company 2: Apex Global (Isolated Tenant)</span>
+                <span className="text-[9px] font-mono text-purple-400">Tenant B</span>
+              </p>
+              <div className="grid grid-cols-2 gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setAuthUsername('apex_admin');
+                    setAuthPassword('password123');
+                  }}
+                  className="p-2 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
+                >
+                  <div className="text-[11px] font-semibold text-purple-300">Apex Admin</div>
+                  <div className="text-[10px] text-slate-400">apex_admin / password123</div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setAuthMode('signin');
+                    setAuthUsername('apex_dev');
+                    setAuthPassword('password123');
+                  }}
+                  className="p-2 rounded-lg bg-slate-800/80 hover:bg-slate-800 border border-slate-700/80 text-left transition-colors"
+                >
+                  <div className="text-[11px] font-semibold text-amber-300">Apex Dev (Eng)</div>
+                  <div className="text-[10px] text-slate-400">apex_dev / password123</div>
+                </button>
+              </div>
             </div>
           </div>
         </div>
@@ -942,13 +1011,18 @@ export default function App() {
 
         {/* Conversation List */}
         <div className="flex-1 flex flex-col min-h-0">
-          <div className="p-3 pb-2 flex items-center justify-between">
-            <span className="text-[11px] font-semibold text-slate-400 uppercase tracking-wider">
-              Recent Chats
-            </span>
+          <div className="p-3 pb-2 flex items-center justify-between border-b border-slate-800/40">
+            <div>
+              <span className="text-[11px] font-semibold text-slate-300 uppercase tracking-wider block">
+                {currentUser.role === 'admin' ? 'Admin Queries' : 'Private Chats'}
+              </span>
+              <span className="text-[10px] text-emerald-400 block font-mono">
+                Isolated to {currentUser.username}
+              </span>
+            </div>
             <button
               onClick={startNewConversation}
-              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors text-xs flex items-center gap-1"
+              className="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors text-xs flex items-center gap-1 cursor-pointer"
               title="New chat"
             >
               <Plus className="h-3.5 w-3.5" />
@@ -1324,9 +1398,13 @@ export default function App() {
             <div className="max-w-5xl mx-auto space-y-6">
               <div className="flex items-center justify-between">
                 <div>
-                  <h1 className="text-xl font-bold text-white">Document Library</h1>
+                  <h1 className="text-xl font-bold text-white">
+                    {currentUser.role === 'admin' ? 'Document Library' : `${currentUser.department_name || 'My Department'} Library`}
+                  </h1>
                   <p className="text-xs text-slate-400 mt-1">
-                    Manage indexed policies, manuals, and department knowledge assets.
+                    {currentUser.role === 'admin'
+                      ? `Organization Knowledge Base · ${currentUser.tenant_name} (Admin Oversight)`
+                      : `Scoped knowledge assets and department documents for ${currentUser.department_name || 'your department'}.`}
                   </p>
                 </div>
                 {currentUser.role === 'admin' && (
@@ -1341,6 +1419,59 @@ export default function App() {
                   </button>
                 )}
               </div>
+
+              {currentUser.role !== 'admin' ? (
+                <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between">
+                  <div className="flex items-center gap-3">
+                    <div className="p-2.5 rounded-xl bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+                      <Shield className="h-5 w-5" />
+                    </div>
+                    <div>
+                      <h3 className="text-xs font-semibold text-white flex items-center gap-2">
+                        Department Access Isolation Active
+                        <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                          {currentUser.department_name || 'My Department'}
+                        </span>
+                      </h3>
+                      <p className="text-[11px] text-slate-400 mt-0.5">
+                        You can only view documents assigned to your department and approved company-wide handbooks. Confidential records from other departments (HR, Finance, Legal) are isolated and restricted.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="p-4 rounded-xl bg-slate-900 border border-slate-800 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold text-white">Administrator Department Filter:</span>
+                    <span className="text-[10px] text-slate-400">
+                      Viewing: {selectedDeptFilter === 'all' ? 'All Departments' : departmentsList.find(d => d.id === selectedDeptFilter)?.name || selectedDeptFilter}
+                    </span>
+                  </div>
+                  <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                    <button
+                      type="button"
+                      onClick={() => { setSelectedDeptFilter('all'); loadDocuments('all'); }}
+                      className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                        selectedDeptFilter === 'all' ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      All Departments
+                    </button>
+                    {departmentsList.map((d) => (
+                      <button
+                        key={d.id}
+                        type="button"
+                        onClick={() => { setSelectedDeptFilter(d.id); loadDocuments(d.id); }}
+                        className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-colors whitespace-nowrap cursor-pointer ${
+                          selectedDeptFilter === d.id ? 'bg-indigo-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {d.name} ({d.code})
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Upload Card (Admin Only) */}
               {currentUser.role === 'admin' && (
