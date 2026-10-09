@@ -126,11 +126,19 @@ def search(tid, doc_ids, query, k=8):
         scored.sort(key=lambda t: -t[1])
         dense = [i for i, s in scored[: k * 2] if s > 0]
 
-    # --- sparse leg (always available) --------------------------------------
+    # --- sparse leg (always available) -------------------------------------
+    # BM25's idf can be zero or negative on very small corpora (1-2 docs), so
+    # we do not require score > 0. Instead: keep chunks that share at least one
+    # meaningful query token, ranked by BM25 score. A query that matches no
+    # chunk at all yields no candidates → the agent reports "not found".
     from rank_bm25 import BM25Okapi
     bm = BM25Okapi([_tok(info[i][0]) for i in order])
     sc = bm.get_scores(_tok(query))
-    sparse = [order[i] for i in sorted(range(len(sc)), key=lambda i: -sc[i])[: k * 2] if sc[i] > 0]
+    qtok = {t for t in _tok(query) if len(t) >= 3}
+    doc_toks = [{t for t in _tok(info[i][0]) if len(t) >= 3} for i in order]
+    cand = [i for i in range(len(sc)) if qtok & doc_toks[i]]
+    cand.sort(key=lambda i: -sc[i])
+    sparse = [order[i] for i in cand[: k * 2]]
 
     # --- Reciprocal Rank Fusion --------------------------------------------
     rrf: dict[str, float] = {}

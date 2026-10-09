@@ -58,6 +58,10 @@ class _Cursor:
     def fetchall(self):
         return self._cur.fetchall()
 
+    def __iter__(self):
+        """Iterate rows directly (matches sqlite3.Cursor behaviour)."""
+        return iter(self._cur.fetchall())
+
     @property
     def rowcount(self):
         return self._cur.rowcount

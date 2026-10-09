@@ -1,8 +1,19 @@
-frontend/.venv/
+# --- dependencies / build output ---
+node_modules/
+.next/
+dist/
 __pycache__/
 *.pyc
+
+# --- python ---
 backend/.venv/
-frontend/.venv/
-__pycache__/
-*.pyc
+backend/data/
+
+# --- secrets: NEVER commit these ---
+.env
+.env.local
 .vercel
+
+# --- misc ---
+.DS_Store
+*.log

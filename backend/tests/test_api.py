@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 _TMP = tempfile.mkdtemp(prefix="omnirag_test_")
 os.environ["OMNIRAG_DATA_DIR"] = _TMP
 os.environ["DATABASE_URL"] = ""          # sqlite for tests
-os.environ["JWT_SECRET"] = "test-secret"
+os.environ["JWT_SECRET"] = "test-secret-0123456789abcdef0123456789abcdef"
 os.environ["ALLOW_ORG_SIGNUP"] = "true"
 os.environ["CORS_ORIGINS"] = "http://localhost:3000"
 os.environ["MAX_UPLOAD_MB"] = "4"

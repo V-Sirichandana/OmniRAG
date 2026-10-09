@@ -206,18 +206,32 @@ async def upload(
             c.execute("DELETE FROM documents WHERE id=?", (old["id"],))
 
     doc_id = D.uid()
-    try:
-        n = rag.ingest(u["tenant_id"], doc_id, name, data)
-    except Exception as e:
-        raise HTTPException(422, f"Could not read file: {e}")
-    if n == 0:
-        raise HTTPException(422, "No extractable text found (scanned PDFs need OCR)")
-
+    # Stage the document row first: chunks reference documents(id) via foreign
+    # key, so the parent row must exist before ingestion inserts its chunks.
     with D.db() as c:
         c.execute(
             "INSERT INTO documents(id,tenant_id,filename,visibility,department,uploaded_by,chunks,content) "
             "VALUES(?,?,?,?,?,?,?,?)",
-            (doc_id, u["tenant_id"], name, visibility, department.strip(), u["id"], n, data))
+            (doc_id, u["tenant_id"], name, visibility, department.strip(), u["id"], 0, data))
+
+    def _unstage():
+        """Remove the staged row if extraction/ingestion failed."""
+        rag.delete_doc(u["tenant_id"], doc_id)
+        with D.db() as c:
+            c.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+
+    try:
+        n = rag.ingest(u["tenant_id"], doc_id, name, data)
+        if n == 0:
+            raise ValueError("No extractable text found (scanned PDFs need OCR)")
+    except Exception as e:
+        _unstage()
+        if isinstance(e, ValueError):
+            raise HTTPException(422, str(e))
+        raise HTTPException(422, f"Could not read file: {e}")
+
+    with D.db() as c:
+        c.execute("UPDATE documents SET chunks=? WHERE id=?", (n, doc_id))
         if visibility == "restricted":
             _set_acl(c, doc_id, u["tenant_id"], [x for x in allowed_user_ids.split(",") if x])
     D.audit(u["tenant_id"], u["id"], "doc_uploaded", f"{name} ({visibility})")
