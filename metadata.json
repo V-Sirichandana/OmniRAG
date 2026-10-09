@@ -1,0 +1,8 @@
+{
+  "name": "OmniRAG",
+  "description": "Secure Multi-Tenant RAG Platform for Enterprise Knowledge Retrieval with role-based access control, source citations, verification, and audit logging.",
+  "requestFramePermissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
