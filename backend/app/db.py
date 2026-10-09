@@ -7,7 +7,7 @@ dialects; only the connection setup and the `messages.id` primary key differ.
 """
 import sqlite3, uuid
 from contextlib import contextmanager
-from .config import DB_PATH, DATABASE_URL
+from .config import DB_PATH, DATABASE_URL, DEFAULT_DEPARTMENTS
 
 PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
@@ -160,9 +160,21 @@ def init():
         for table, column, decl in _MIGRATIONS:
             if not _has_column(c, table, column):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        # Existing tenants (from older local databases) get default departments too.
+        for r in c.execute("SELECT id FROM tenants").fetchall():
+            seed_departments(c, r["id"])
 
 
 def uid(): return uuid.uuid4().hex
+
+
+def seed_departments(cur, tenant_id: str):
+    """Give a tenant the standard five departments (idempotent)."""
+    for name, code in DEFAULT_DEPARTMENTS:
+        if not cur.execute("SELECT 1 FROM departments WHERE tenant_id=? AND name=?",
+                           (tenant_id, name)).fetchone():
+            cur.execute("INSERT INTO departments(id,tenant_id,name,code) VALUES(?,?,?,?)",
+                        (uid(), tenant_id, name, code))
 
 
 def audit(tenant_id, user_id, action, detail=""):

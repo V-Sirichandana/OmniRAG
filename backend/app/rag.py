@@ -90,56 +90,45 @@ def search(tid, doc_ids, query, k=8):
     """Hybrid: dense + BM25 fused with Reciprocal Rank Fusion, scoped to doc_ids."""
     if not doc_ids:
         return []
-    # Chunk the IN (...) list to stay well under statement limits.
-    allowed = []
+    # Chunk the IN (...) list to stay well under statement parameter limits.
+    rows = []
     for i in range(0, len(doc_ids), 400):
         part = doc_ids[i:i + 400]
         with D.db() as c:
-            allowed += c.execute(
-                f"SELECT ch.id, ch.text, ch.page, ch.embedding, d.filename FROM chunks ch "
-                f"JOIN documents d ON d.id=ch.doc_id "
+            rows += c.execute(
+                f"SELECT ch.id, ch.text, ch.page, ch.doc_id, ch.embedding, d.filename "
+                f"FROM chunks ch JOIN documents d ON d.id=ch.doc_id "
                 f"WHERE ch.tenant_id=? AND ch.doc_id IN ({','.join('?' * len(part))})",
                 (tid, *part),
             ).fetchall()
-    if not allowed:
+    if not rows:
         return []
 
-    info = {r["id"]: (r["text"], {"doc_id": r["filename"], "filename": r["filename"], "page": r["page"],
-                                  "_doc_id": None}) for r in allowed}
-    # keep the real doc_id in meta (used for debugging / future ACL joins)
-    doc_ids_by_chunk = {}
-    for i in range(0, len(doc_ids), 400):
-        part = doc_ids[i:i + 400]
-        with D.db() as c:
-            for r in c.execute(
-                f"SELECT id, doc_id FROM chunks WHERE tenant_id=? AND doc_id IN ({','.join('?' * len(part))})",
-                (tid, *part),
-            ).fetchall():
-                doc_ids_by_chunk[r["id"]] = r["doc_id"]
-    for cid, meta in info.items():
-        meta["meta_doc_id"] = doc_ids_by_chunk.get(cid)
-        meta["doc_id"] = doc_ids_by_chunk.get(cid)
+    # id -> (text, meta) in the same shape the agent expects
+    info = {
+        r["id"]: (r["text"], {"doc_id": r["doc_id"], "filename": r["filename"], "page": r["page"]})
+        for r in rows
+    }
+    order = [r["id"] for r in rows]
+    vectors = {}
+    for r in rows:
+        if r["embedding"]:
+            try:
+                vectors[r["id"]] = json.loads(r["embedding"])
+            except Exception:
+                pass
 
-    order = [r["id"] for r in allowed]
-    texts = [info[i][0] for i in order]
-
-    # --- dense leg (None when no embedding provider is configured) ----------
+    # --- dense leg (skipped when no embedding provider is configured) -------
     dense: list[str] = []
     qv = E.embed([query])
     if qv:
-        vecs = []
-        for r in allowed:
-            try:
-                vecs.append(json.loads(r["embedding"]) if r["embedding"] else None)
-            except Exception:
-                vecs.append(None)
-        scored = [(i, _cosine(qv[0], v)) for i, v in zip(order, vecs) if v]
+        scored = [(i, _cosine(qv[0], v)) for i, v in vectors.items() if v]
         scored.sort(key=lambda t: -t[1])
         dense = [i for i, s in scored[: k * 2] if s > 0]
 
     # --- sparse leg (always available) --------------------------------------
     from rank_bm25 import BM25Okapi
-    bm = BM25Okapi([_tok(t) for t in texts])
+    bm = BM25Okapi([_tok(info[i][0]) for i in order])
     sc = bm.get_scores(_tok(query))
     sparse = [order[i] for i in sorted(range(len(sc)), key=lambda i: -sc[i])[: k * 2] if sc[i] > 0]
 
@@ -148,13 +137,8 @@ def search(tid, doc_ids, query, k=8):
     for lst in (dense, sparse):
         for r, i in enumerate(lst):
             rrf[i] = rrf.get(i, 0) + 1 / (60 + r)
-    if not rrf and not dense:
-        # No lexical overlap at all: fall back to the dense order so a configured
-        # embedding model can still surface related passages.
-        rrf = {i: 1.0 for i in dense}
     top = sorted(rrf, key=rrf.get, reverse=True)[:k]
-    return [{"id": i, "text": info[i][0], "meta": {k: v for k, v in info[i][1].items() if k != "_doc_id"},
-             "score": None} for i in top]
+    return [{"id": i, "text": info[i][0], "meta": info[i][1], "score": None} for i in top]
 
 
 def rerank(query, hits, top=6):
