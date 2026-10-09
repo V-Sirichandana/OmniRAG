@@ -1656,11 +1656,40 @@ export default function App() {
         {activeTab === 'admin' && currentUser.role === 'admin' && (
           <div className="flex-1 overflow-y-auto p-8">
             <div className="max-w-5xl mx-auto space-y-6">
-              <div>
-                <h1 className="text-xl font-bold text-white">Administration</h1>
-                <p className="text-xs text-slate-400 mt-1">
-                  Tenant metrics, department assignments, single-use invite codes, and activity audit trail.
-                </p>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h1 className="text-xl font-bold text-white flex items-center gap-2">
+                    <span>Administration</span>
+                    <span className="text-[11px] font-mono font-normal bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-2 py-0.5 rounded-full">
+                      Admin Portal
+                    </span>
+                  </h1>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Tenant metrics, document ingestion, employee assignments, invite codes, and activity audit trail.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const el = document.getElementById('admin-doc-upload-section');
+                      if (el) el.scrollIntoView({ behavior: 'smooth' });
+                      else setActiveTab('library');
+                    }}
+                    className="px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-2 shadow-lg shadow-indigo-600/25 transition-all cursor-pointer"
+                  >
+                    <Upload className="h-4 w-4" />
+                    <span>Upload Document</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('library')}
+                    className="px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-slate-200 border border-slate-700 text-xs font-medium flex items-center gap-1.5 transition-colors cursor-pointer"
+                  >
+                    <FileText className="h-3.5 w-3.5" />
+                    <span>Document Library</span>
+                  </button>
+                </div>
               </div>
 
               {/* Stats Grid */}
@@ -1683,7 +1712,7 @@ export default function App() {
               </div>
 
               {/* Document Upload & Cloud Sync Quick Access for Admin */}
-              <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6">
+              <div id="admin-doc-upload-section" className="bg-slate-900 border border-slate-800 rounded-2xl p-6 scroll-mt-6">
                 <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-4">
                   <div>
                     <h2 className="text-sm font-semibold text-white flex items-center gap-2">

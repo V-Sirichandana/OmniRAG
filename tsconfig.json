@@ -19,5 +19,5 @@
     "esModuleInterop": true,
     "types": ["vite/client", "node"]
   },
-  "include": ["src", "server.ts", "src/vite-env.d.ts", "vite-env.d.ts"]
+  "include": ["src", "server.ts"]
 }
