@@ -5,7 +5,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "OmniRAG — Enterprise Knowledge Base",
   description:
-    "Secure multi-tenant agentic RAG platform for enterprise knowledge retrieval with cross-department access control and strict citations.",
+    "Secure multi-tenant agentic RAG platform for enterprise knowledge retrieval with cross-department access control and grounded answers.",
 };
 
 export const viewport: Viewport = {

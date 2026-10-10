@@ -38,22 +38,10 @@ export interface Doc {
   allowed_user_ids?: string[];
 }
 
-export interface Citation {
-  doc_id?: string;
-  filename: string;
-  page: number;
-  snippet?: string;
-}
-
 export interface ChatResponse {
   answer: string;
-  citations: Citation[];
-  grounded: boolean;
-  confidence?: number;
-  provider?: string | null;
   latency_ms?: number;
   conversation_id: string;
-  trace?: string[];
 }
 
 export interface Conversation {
@@ -65,11 +53,6 @@ export interface Conversation {
 export interface Message {
   role: "user" | "assistant";
   content: string;
-  citations?: Citation[];
-  grounded?: boolean;
-  confidence?: number;
-  provider?: string | null;
-  latency_ms?: number;
 }
 
 export interface AdminUser {

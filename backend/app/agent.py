@@ -6,8 +6,22 @@ from . import rag, llm
 from .config import MIN_RERANK
 
 NOT_FOUND = "I couldn't find this in the documents you have access to. Try rephrasing, or ask an administrator to upload the relevant document."
-SYS = ("You are an enterprise knowledge assistant. Answer ONLY from the numbered sources. Cite sources inline like [1], [2]. "
-       "If the sources do not contain the answer, say so plainly. Never invent facts.")
+SYS = ("You are an enterprise knowledge assistant. Answer ONLY from the numbered context passages. "
+       "Write the answer as plain markdown and do NOT include any citation markers, reference numbers, "
+       "footnotes or page references (such as [1] or 【1†p.2】) anywhere in the answer — the numbered "
+       "context is only for you to ground the answer. If the context does not contain the answer, say "
+       "so plainly. Never invent facts.")
+
+# citation/reference markers some models emit anyway (e.g. [1] or 【5†p.3】)
+_CITE = re.compile(r"(?:\s*【\d+†[^】]*】)+|(?:\s*\[\d+\])+")
+
+
+def clean_markers(text: str) -> str:
+    """Strip any citation/reference markers from an answer before it is shown."""
+    t = _CITE.sub("", text)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r" +([.,;:!?])", r"\1", t)
+    return t.strip()
 
 class S(TypedDict, total=False):
     question: str; history: list; tenant_id: str; doc_ids: list; provider: str
@@ -70,6 +84,6 @@ GRAPH = g.compile()
 
 def run(question, tenant_id, doc_ids, history, provider=None) -> dict:
     out = GRAPH.invoke({"question": question, "tenant_id": tenant_id, "doc_ids": doc_ids, "history": history, "provider": provider, "retries": 0})
-    cites = [{"n": i + 1, "filename": h["meta"]["filename"], "page": h["meta"]["page"], "snippet": h["text"][:280]} for i, h in enumerate(out.get("hits", []))]
-    return {"answer": out["answer"], "citations": cites if out.get("hits") else [], "grounded": out.get("grounded", True),
-            "confidence": out.get("score", 0), "provider": (out.get("used") or [None])[-1], "trace": out.get("trace", [])}
+    # No sources, no model name in the result — retrieval details stay server-side.
+    return {"answer": clean_markers(out["answer"]), "grounded": out.get("grounded", True),
+            "confidence": out.get("score", 0), "trace": out.get("trace", [])}

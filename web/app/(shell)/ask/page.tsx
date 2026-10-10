@@ -1,9 +1,9 @@
 "use client";
 
 /**
- * Ask Documents — chat over the organization's indexed documents.
- * Streams nothing (single request), shows answers with numbered source
- * citations, and states plainly when the answer was not found.
+ * Ask Documents — chat over the department's indexed documents.
+ * Streams nothing (single request); answers are plain text (no source
+ * list, no model info) and state plainly when nothing was found.
  */
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -11,13 +11,12 @@ import {
   AlertTriangle,
   BookOpenCheck,
   CornerDownLeft,
-  FileText,
   Sparkles,
 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { ChatResponse, Message, Providers } from "@/lib/types";
-import { Badge, ErrorNote } from "@/components/ui";
+import { ErrorNote } from "@/components/ui";
 
 const LANGUAGES = ["English", "Español", "Français", "हिन्दी"];
 
@@ -82,18 +81,7 @@ function AskPage() {
           conversation_id: convId,
           language,
         });
-        setMessages((m) => [
-          ...m,
-          {
-            role: "assistant",
-            content: res.answer,
-            citations: res.citations,
-            grounded: res.grounded,
-            confidence: res.confidence,
-            provider: res.provider,
-            latency_ms: res.latency_ms,
-          },
-        ]);
+        setMessages((m) => [...m, { role: "assistant", content: res.answer }]);
         if (!convId && res.conversation_id) {
           router.replace(`/ask?c=${res.conversation_id}`);
         }
@@ -117,16 +105,10 @@ function AskPage() {
           <div>
             <h1 className="text-xl font-bold text-white">Ask Documents</h1>
             <p className="mt-0.5 text-sm text-muted">
-              Only from your department&apos;s documents — every answer cites its
-              sources.
+              Plain answers drawn only from your department&apos;s documents.
             </p>
           </div>
           <div className="flex items-center gap-2">
-            {providers && (
-              <Badge tone={noLlm ? "amber" : "emerald"}>
-                {noLlm ? "LLM key missing" : `LLM: ${providers.llm[0]}`}
-              </Badge>
-            )}
             <select
               value={language}
               onChange={(e) => setLanguage(e.target.value)}
@@ -166,9 +148,8 @@ function AskPage() {
                 Knowledge ready, {user?.username}
               </h2>
               <p className="mt-1 text-sm text-muted">
-                Ask a question about your department&apos;s indexed documents. Answers
-                include strict, numbered citations — and say so plainly when the
-                information is not there.
+                Ask a question about your department&apos;s indexed documents. You get a
+                plain answer — and a clear note when the information is not there.
               </p>
               <div className="mt-6 space-y-2.5 text-left">
                 {SUGGESTIONS.map((s) => (
@@ -199,51 +180,6 @@ function AskPage() {
                     {m.content}
                   </p>
 
-                  {/* citations */}
-                  {m.citations && m.citations.length > 0 && (
-                    <div className="mt-3 border-t border-line pt-3">
-                      <p className="mb-2 text-[10px] font-semibold tracking-[0.14em] text-slate-500">
-                        SOURCES
-                      </p>
-                      <div className="space-y-2">
-                        {m.citations.map((c, ci) => (
-                          <details key={ci} className="group rounded-lg border border-line bg-ink-2/70 px-3 py-2">
-                            <summary className="flex cursor-pointer list-none items-center gap-2 text-xs text-slate-300">
-                              <span className="grid h-5 w-5 shrink-0 place-items-center rounded bg-brand/25 font-mono text-[10px] font-bold text-indigo-300">
-                                {ci + 1}
-                              </span>
-                              <FileText size={12} className="shrink-0 text-slate-500" />
-                              <span className="truncate font-medium">{c.filename}</span>
-                              <span className="shrink-0 text-slate-500">p.{c.page}</span>
-                            </summary>
-                            {c.snippet && (
-                              <p className="mt-2 border-l-2 border-brand/50 pl-3 text-xs leading-relaxed text-slate-400">
-                                {c.snippet}
-                              </p>
-                            )}
-                          </details>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {(m.citations?.length ?? 0) === 0 && (
-                    <p className="mt-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-[11px] text-amber-200">
-                      No supporting sources found in your accessible documents.
-                    </p>
-                  )}
-
-                  {/* meta */}
-                  <div className="mt-3 flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
-                    {typeof m.confidence === "number" && (
-                      <Badge tone={m.confidence >= 0.7 ? "emerald" : m.confidence >= 0.4 ? "amber" : "red"}>
-                        {Math.round(m.confidence * 100)}% confidence
-                      </Badge>
-                    )}
-                    {m.grounded === false && <Badge tone="amber">partially grounded</Badge>}
-                    {m.provider && <span>via {m.provider}</span>}
-                    {typeof m.latency_ms === "number" && <span>{(m.latency_ms / 1000).toFixed(1)}s</span>}
-                  </div>
                 </div>
               </div>
             ),

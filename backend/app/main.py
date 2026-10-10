@@ -377,10 +377,11 @@ def chat(b: Ask, u=Depends(S.current_user)):
         c.execute("INSERT INTO messages(conv_id,role,content) VALUES(?,?,?)", (cid, "user", b.question))
         c.execute("INSERT INTO messages(conv_id,role,content,meta) VALUES(?,?,?,?)",
                   (cid, "assistant", res["answer"],
-                   json.dumps({k: res[k] for k in ("citations", "grounded", "confidence", "provider",
+                   json.dumps({k: res[k] for k in ("grounded", "confidence",
                                                    "trace", "latency_ms")})))
     D.audit(u["tenant_id"], u["id"], "query", b.question)
-    return {**res, "conversation_id": cid}
+    # intentionally minimal: no source list, no model name, no confidence shown
+    return {"answer": res["answer"], "conversation_id": cid, "latency_ms": res["latency_ms"]}
 
 
 @app.get("/api/conversations")
@@ -397,8 +398,10 @@ def conversation(cid: str, u=Depends(S.current_user)):
         if not c.execute("SELECT 1 FROM conversations WHERE id=? AND user_id=?",
                          (cid, u["id"])).fetchone():
             raise HTTPException(404, "Not found")
-        return [{"role": r["role"], "content": r["content"],
-                 **(json.loads(r["meta"]) if r["meta"] else {})}
+        # only role + content are served; assistant text is scrubbed of any
+        # citation markers older answers may still contain
+        return [{"role": r["role"],
+                 "content": agent.clean_markers(r["content"]) if r["role"] == "assistant" else r["content"]}
                 for r in c.execute("SELECT * FROM messages WHERE conv_id=? ORDER BY id", (cid,))]
 
 
