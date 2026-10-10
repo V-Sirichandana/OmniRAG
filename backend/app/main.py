@@ -15,12 +15,18 @@ from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
 from . import agent, db as D, embeddings as E, llm, rag, security as S
-from .config import ALLOW_ORG_SIGNUP, ALLOWED_EXT, CORS, MAX_UPLOAD_MB
+from .config import ALLOW_ORG_SIGNUP, ALLOWED_EXT, CORS, DATABASE_URL, MAX_UPLOAD_MB
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     D.init()          # create/migrate schema on startup (both SQLite and Postgres)
+    # Production safety: never let the ephemeral /tmp SQLite fallback pass
+    # silently for a live deployment — data would vanish on every cold start.
+    if os.getenv("VERCEL") and not DATABASE_URL:
+        print("WARNING: running on Vercel without DATABASE_URL — using ephemeral "
+              "/tmp storage, ALL data is lost on every cold start. Set DATABASE_URL "
+              "(Postgres, e.g. Neon) in the project environment variables.", flush=True)
     yield
 
 
