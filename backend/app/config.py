@@ -32,6 +32,10 @@ JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_hex(32)  # random per run 
 CORS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 ALLOW_ORG_SIGNUP = os.getenv("ALLOW_ORG_SIGNUP", "true").lower() == "true"
 MIN_RERANK = float(os.getenv("MIN_RERANK_SCORE", "0.05"))
+# Evidence-sufficiency gate (agent): minimum fraction of the question's content
+# terms that must appear in the retrieved evidence before generation is
+# attempted. Deterministic and LLM-free — see app/rag.py::sufficiency.
+MIN_EVIDENCE_COVERAGE = float(os.getenv("MIN_EVIDENCE_COVERAGE", "0.34"))
 
 # Vercel Functions accept at most ~4.5 MB per request body.
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "4"))

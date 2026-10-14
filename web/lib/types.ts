@@ -1,7 +1,12 @@
 /** Shared API types — mirror the FastAPI response shapes. */
 
 export type Role = "admin" | "member";
-export type Visibility = "org" | "department" | "restricted";
+export type Visibility =
+  | "org" // legacy alias — behaves like "department"
+  | "department"
+  | "organization"
+  | "selected_departments"
+  | "restricted";
 
 export interface User {
   id: string;
@@ -11,6 +16,9 @@ export interface User {
   department: string;
   employee_id?: string | null;
   tenant_name?: string;
+  /** Manager designation (backend-enforced workspace gate, default 0/false).
+   *  Grants no extra data — only access to the Team workspace UI/API. */
+  is_manager?: number | boolean;
 }
 
 export interface Session {
@@ -27,6 +35,11 @@ export interface Department {
   members: number;
 }
 
+export interface DocTarget {
+  id: string;
+  name: string;
+}
+
 export interface Doc {
   id: string;
   filename: string;
@@ -36,6 +49,8 @@ export interface Doc {
   created: string;
   uploaded_by: string;
   allowed_user_ids?: string[];
+  download_allowed?: boolean;
+  departments?: DocTarget[];
 }
 
 export interface ChatResponse {
@@ -61,6 +76,7 @@ export interface AdminUser {
   role: Role;
   department: string;
   employee_id?: string | null;
+  is_manager?: number | boolean;
   created: string;
 }
 
@@ -85,6 +101,16 @@ export interface Stats {
   documents: number;
   queries: number;
   chunks: number;
+  /** stored bytes across this tenant's documents (SUM of file content) */
+  storage?: number;
+}
+
+/** GET /api/team/overview — department data for designated managers only. */
+export interface TeamOverview {
+  department: string;
+  member_count: number;
+  document_count: number;
+  documents: Doc[];
 }
 
 export interface Providers {

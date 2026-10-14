@@ -8,7 +8,7 @@ import { getToken } from "@/lib/api";
 export default function Home() {
   const router = useRouter();
   useEffect(() => {
-    router.replace(getToken() ? "/ask" : "/login");
+    router.replace(getToken() ? "/dashboard" : "/login");
   }, [router]);
   return (
     <div className="flex min-h-screen items-center justify-center">

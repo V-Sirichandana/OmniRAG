@@ -8,6 +8,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   ClipboardCopy,
+  Crown,
   IdCard,
   KeyRound,
   ScrollText,
@@ -19,7 +20,7 @@ import {
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { AdminUser, AuditEntry, Department, Invite, Role, Stats } from "@/lib/types";
-import { Badge, Btn, ErrorNote, Field, Panel, formatDate, inputCls } from "@/components/ui";
+import { Badge, Btn, ErrorNote, Field, PageHeader, Panel, formatDate, inputCls } from "@/components/ui";
 
 const STATS = [
   { key: "users", label: "Members", icon: Users },
@@ -36,11 +37,13 @@ const ACTION_TONES: Record<string, "emerald" | "indigo" | "amber" | "red" | "sla
   user_deleted: "red",
   invite_created: "amber",
   doc_uploaded: "indigo",
+  doc_downloaded: "slate",
   doc_deleted: "amber",
   doc_access_changed: "amber",
   dept_created: "slate",
   dept_deleted: "red",
   query: "slate",
+  search: "indigo",
 };
 
 export default function AdminPage() {
@@ -53,6 +56,7 @@ export default function AdminPage() {
   const [invites, setInvites] = useState<Invite[]>([]);
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [error, setError] = useState("");
+  const [loading, setLoading] = useState(true);
   const [issued, setIssued] = useState<string>("");
 
   // invite form
@@ -76,8 +80,10 @@ export default function AdminPage() {
         setDepts(d);
         setInvites(i);
         setAudit(a);
+        setError("");
       })
-      .catch((e) => setError(e instanceof ApiError ? e.message : "Failed to load"));
+      .catch((e) => setError(e instanceof ApiError ? e.message : "Failed to load"))
+      .finally(() => setLoading(false));
   }, [isAdmin]);
 
   useEffect(load, [load]);
@@ -92,7 +98,10 @@ export default function AdminPage() {
     );
   }
 
-  async function patchUser(id: string, body: { role?: Role; department?: string }) {
+  async function patchUser(
+    id: string,
+    body: { role?: Role; department?: string; is_manager?: boolean },
+  ) {
     try {
       await api.patch(`/api/admin/users/${id}`, body);
       load();
@@ -134,25 +143,30 @@ export default function AdminPage() {
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 px-5 py-8 sm:px-8">
-      <div>
-        <h1 className="text-xl font-bold text-white">Administration</h1>
-        <p className="mt-1 text-sm text-muted">
-          Manage organization members, roles, departments, employee IDs and the
-          audit trail — all scoped to {user?.tenant_name}.
-        </p>
-      </div>
+      <PageHeader
+        icon={ShieldCheck}
+        title="Administration"
+        subtitle={`Manage organization members, roles, departments, employee IDs and the audit trail — all scoped to ${user?.tenant_name}`}
+      />
 
       <ErrorNote>{error}</ErrorNote>
+
+      {loading && stats === null && (
+        <div className="panel flex items-center gap-3 px-5 py-4 text-xs text-slate-500">
+          <span className="h-2 w-2 animate-ping rounded-full bg-brand-2" />
+          Loading administration data…
+        </div>
+      )}
 
       {/* stats */}
       <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
         {STATS.map((s) => (
           <div key={s.key} className="panel flex items-center gap-3 p-4">
-            <span className="grid h-10 w-10 place-items-center rounded-xl bg-brand/15 text-brand-2">
+            <span className="grid h-10 w-10 place-items-center rounded-xl bg-brand/10 text-brand-2">
               <s.icon size={18} />
             </span>
             <div className="min-w-0">
-              <p className="text-xl font-bold text-white">
+              <p className="text-xl font-bold tabular-nums text-slate-900">
                 {stats ? stats[s.key] : "—"}
               </p>
               <p className="truncate text-[11px] text-muted">{s.label}</p>
@@ -165,30 +179,31 @@ export default function AdminPage() {
       <Panel
         icon={Users}
         title="Employee Directory & Department Allocation"
-        subtitle="Roles and departments apply immediately on the backend"
+        subtitle="Roles, departments and manager designations apply immediately on the backend"
         bodyClassName="p-0"
       >
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-left text-sm">
+          <table className="w-full min-w-[820px] text-left text-sm">
             <thead>
-              <tr className="border-b border-line text-[11px] uppercase tracking-wide text-slate-500">
+              <tr className="border-b border-line bg-panel-2 text-[11px] uppercase tracking-wide text-slate-500">
                 <th className="px-5 py-3 font-medium">Employee</th>
                 <th className="px-3 py-3 font-medium">Employee ID</th>
                 <th className="px-3 py-3 font-medium">Department</th>
                 <th className="px-3 py-3 font-medium">Role</th>
+                <th className="px-3 py-3 font-medium">Manager</th>
                 <th className="px-3 py-3 font-medium">Joined</th>
                 <th className="px-3 py-3 text-right font-medium">Actions</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
               {users.map((u) => (
-                <tr key={u.id} className="transition hover:bg-panel-2/40">
+                <tr key={u.id} className="transition hover:bg-panel-2/60">
                   <td className="px-5 py-3">
                     <div className="flex items-center gap-3">
                       <span className="grid h-8 w-8 place-items-center rounded-full bg-gradient-to-br from-brand to-accent text-xs font-bold text-white">
                         {u.username.slice(0, 1).toUpperCase()}
                       </span>
-                      <span className="font-medium text-white">
+                      <span className="font-medium text-slate-900">
                         {u.username}
                         {u.id === user?.id && (
                           <span className="ml-1.5 text-[10px] text-slate-500">(You)</span>
@@ -197,7 +212,7 @@ export default function AdminPage() {
                     </div>
                   </td>
                   <td className="px-3 py-3">
-                    <span className="rounded-md bg-indigo-500/15 px-2 py-1 font-mono text-[11px] text-indigo-300">
+                    <span className="rounded-md bg-indigo-50 px-2 py-1 font-mono text-[11px] text-indigo-700">
                       {u.employee_id || "—"}
                     </span>
                   </td>
@@ -205,7 +220,7 @@ export default function AdminPage() {
                     <select
                       value={u.department}
                       onChange={(e) => void patchUser(u.id, { department: e.target.value })}
-                      className="rounded-md border border-line bg-ink-2 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-brand-2"
+                      className="rounded-md border border-line-2 bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-brand-2"
                     >
                       <option value="General">General</option>
                       {depts.map((d) => (
@@ -220,11 +235,28 @@ export default function AdminPage() {
                       value={u.role}
                       onChange={(e) => void patchUser(u.id, { role: e.target.value as Role })}
                       disabled={u.id === user?.id}
-                      className="rounded-md border border-line bg-ink-2 px-2 py-1.5 text-xs text-slate-200 outline-none focus:border-brand-2 disabled:opacity-50"
+                      className="rounded-md border border-line-2 bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-brand-2 disabled:opacity-50"
                     >
                       <option value="member">Member</option>
                       <option value="admin">Admin</option>
                     </select>
+                  </td>
+                  <td className="px-3 py-3">
+                    <button
+                      onClick={() => void patchUser(u.id, { is_manager: !u.is_manager })}
+                      title={
+                        u.is_manager
+                          ? "Revoke the manager designation"
+                          : "Designate as department manager (Team Workspace only — no extra privileges)"
+                      }
+                      className={`inline-flex items-center gap-1.5 rounded-md border px-2 py-1.5 text-[11px] font-medium transition ${
+                        u.is_manager
+                          ? "border-violet-200 bg-violet-50 text-violet-700 hover:border-violet-300"
+                          : "border-line-2 bg-white text-slate-500 hover:border-brand-2 hover:text-brand-2"
+                      }`}
+                    >
+                      <Crown size={12} /> {u.is_manager ? "Manager" : "Set manager"}
+                    </button>
                   </td>
                   <td className="px-3 py-3 text-xs text-slate-500">
                     {formatDate(u.created)}
@@ -234,7 +266,7 @@ export default function AdminPage() {
                       onClick={() => void removeUser(u)}
                       disabled={u.id === user?.id}
                       title="Remove from organization"
-                      className="rounded-lg p-2 text-slate-500 transition hover:bg-red-500/10 hover:text-red-400 disabled:opacity-30"
+                      className="rounded-lg p-2 text-slate-500 transition hover:bg-red-50 hover:text-red-600 disabled:opacity-30"
                     >
                       <Trash2 size={15} />
                     </button>
@@ -244,6 +276,11 @@ export default function AdminPage() {
             </tbody>
           </table>
         </div>
+        <p className="border-t border-line px-5 py-3 text-[11px] text-slate-500">
+          The manager designation only unlocks the Team Workspace for that user — it grants no
+          access to other departments, roles, invites or the audit trail, and can be revoked
+          at any time.
+        </p>
       </Panel>
 
       <div className="grid gap-6 lg:grid-cols-2">
@@ -287,7 +324,7 @@ export default function AdminPage() {
                     className={`flex-1 rounded-lg border px-3 py-2 text-xs font-medium transition ${
                       days === d
                         ? "border-brand bg-brand text-white"
-                        : "border-line bg-ink-2 text-slate-400 hover:text-white"
+                        : "border-line-2 bg-white text-slate-500 hover:border-brand-2 hover:text-brand-2"
                     }`}
                   >
                     {d} days
@@ -299,12 +336,12 @@ export default function AdminPage() {
               <UserPlus size={15} /> Issue Employee ID
             </Btn>
             {issued && (
-              <div className="flex items-center justify-between gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2.5">
-                <span className="font-mono text-sm font-semibold text-emerald-300">{issued}</span>
+              <div className="flex items-center justify-between gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2.5">
+                <span className="font-mono text-sm font-semibold text-emerald-700">{issued}</span>
                 <button
                   type="button"
                   onClick={() => copy(issued)}
-                  className="flex items-center gap-1.5 text-xs text-emerald-200 hover:text-white"
+                  className="flex items-center gap-1.5 text-xs text-emerald-600 hover:text-emerald-800"
                 >
                   <ClipboardCopy size={13} /> Copy
                 </button>
@@ -335,7 +372,7 @@ export default function AdminPage() {
                 )}
                 {invites.map((i) => (
                   <tr key={i.code} className="hover:bg-panel-2/40">
-                    <td className="px-5 py-3 font-mono text-xs text-indigo-300">{i.code}</td>
+                    <td className="px-5 py-3 font-mono text-xs text-brand-2">{i.code}</td>
                     <td className="px-3 py-3 text-xs text-slate-400">{i.department || "—"}</td>
                     <td className="px-3 py-3">
                       {i.joined_by ? (
@@ -347,7 +384,7 @@ export default function AdminPage() {
                     <td className="px-3 py-3 text-right">
                       <button
                         onClick={() => copy(i.code)}
-                        className="text-xs text-indigo-400 hover:text-indigo-300"
+                        className="text-xs text-brand-2 hover:text-brand"
                       >
                         Copy ID
                       </button>
@@ -378,7 +415,7 @@ export default function AdminPage() {
                   <td className="whitespace-nowrap px-5 py-3 text-xs text-slate-500">
                     {formatDate(a.created)}
                   </td>
-                  <td className="px-3 py-3 text-xs text-slate-300">{a.username}</td>
+                  <td className="px-3 py-3 text-xs text-slate-700">{a.username}</td>
                   <td className="px-3 py-3">
                     <Badge tone={ACTION_TONES[a.action] ?? "slate"}>{a.action}</Badge>
                   </td>

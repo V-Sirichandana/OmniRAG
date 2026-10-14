@@ -16,6 +16,42 @@ from .config import MIN_RERANK  # noqa: F401  (kept for parity with the original
 
 _tok = lambda s: re.findall(r"\w+", s.lower())
 
+# Question stopwords for the sufficiency gate only (BM25 retrieval keeps the
+# raw tokens — this list exists so function words don't dilute coverage).
+_STOP = {
+    "the", "and", "for", "with", "from", "that", "this", "these", "those", "than", "then",
+    "what", "when", "where", "which", "who", "whom", "whose", "why", "how",
+    "does", "did", "doing", "is", "are", "was", "were", "be", "been", "being",
+    "can", "could", "should", "would", "will", "shall", "may", "might", "must",
+    "have", "has", "had", "about", "into", "onto", "them", "they", "their", "there",
+    "you", "your", "our", "its", "not", "any", "all", "also", "much", "many", "most",
+    "some", "such", "per", "via", "over", "under", "between", "during", "before", "after",
+}
+
+
+def _content_tokens(text: str) -> set[str]:
+    return {t for t in _tok(text) if len(t) >= 3 and t not in _STOP}
+
+
+def sufficiency(query: str, hits: list[dict]) -> dict:
+    """Deterministic retrieval-quality signal (no LLM, no network).
+
+    Returns the fraction of the question's content terms present in the
+    retrieved evidence pool. The agent uses this to decide whether evidence
+    is strong enough to attempt generation (else: one controlled retry, then
+    abstention). Purely lexical by design — measurable, cheap, testable.
+    """
+    q = _content_tokens(query)
+    if not q:
+        return {"coverage": 1.0 if hits else 0.0, "hit_terms": 0, "query_terms": 0}
+    if not hits:
+        return {"coverage": 0.0, "hit_terms": 0, "query_terms": len(q)}
+    ev: set[str] = set()
+    for h in hits:
+        ev |= _content_tokens(h["text"])
+    n = len(q & ev)
+    return {"coverage": round(n / len(q), 4), "hit_terms": n, "query_terms": len(q)}
+
 
 def extract(filename: str, data: bytes) -> list[tuple[int, str]]:
     """Return [(page_number, text)] for the uploaded file."""

@@ -56,13 +56,15 @@ def signup(org, user, pw):
     return r.json()
 
 
-def upload(tok, name, text, visibility="org", department="", allowed=""):
+def upload(tok, name, text, visibility="org", department="", allowed="",
+           dept_ids="", download="true"):
     return client.post(
         "/api/documents",
         headers=auth(tok),
         files={"file": (name, text.encode(), "application/octet-stream")},
         data={"visibility": visibility, "department": department,
-              "allowed_user_ids": allowed})
+              "allowed_user_ids": allowed, "department_ids": dept_ids,
+              "download_allowed": download})
 
 
 # ---------------------------------------------------------------------------
@@ -218,10 +220,6 @@ def test_department_visibility_isolation():
     docs = client.get("/api/documents", headers=auth(STATE["hr"]["token"])).json()
     assert "Payroll.txt" not in {d["filename"] for d in docs}
 
-    # strict isolation: even the admin (Human Resources) cannot see Finance files
-    docs = client.get("/api/documents", headers=auth(STATE["acme"]["token"])).json()
-    assert "Payroll.txt" not in {d["filename"] for d in docs}
-
     # a Finance member WOULD see it
     inv = client.post("/api/admin/invites", headers=auth(STATE["acme"]["token"]),
                       json={"role": "member", "department": "Finance & Operations"})
@@ -233,6 +231,10 @@ def test_department_visibility_isolation():
     assert "Payroll.txt" in {d["filename"] for d in docs}
     # an HR document never crosses over to Finance, no matter its visibility
     assert "Handbook.txt" not in {d["filename"] for d in docs}
+
+    # the organization admin manages every document of their own organization
+    docs = client.get("/api/documents", headers=auth(STATE["acme"]["token"])).json()
+    assert "Payroll.txt" in {d["filename"] for d in docs}
 
 
 @test
@@ -249,6 +251,7 @@ def test_restricted_visibility_acl():
         assert reg.status_code == 200, reg.text
         codes.append(reg.json())
     lena, leo = codes
+    STATE["lena"], STATE["leo"] = lena, leo
 
     r = upload(STATE["acme"]["token"], "BoardSecrets.txt",
                "The acquisition target is Globex. Offer ceiling is 400 million.",
@@ -341,10 +344,11 @@ def test_download_roundtrip():
 @test
 def test_delete_doc_removes_chunks():
     tid = STATE["acme"]["user"]["tenant_id"]
-    # strict: the admin cannot delete another department's document (404)
+    # the organization admin manages (and can delete) documents across
+    # departments — but never in another organization (404)
     r = client.delete(f"/api/documents/{STATE['payroll']['id']}",
                       headers=auth(STATE["acme"]["token"]))
-    assert r.status_code == 404
+    assert r.status_code == 200
 
     # delete a document of the admin's own department
     r = upload(STATE["acme"]["token"], "Scrap.txt",
@@ -474,6 +478,389 @@ def test_conversation_isolation():
     assert r.status_code == 404
     assert client.get(f"/api/conversations/{uuid.uuid4().hex}",
                       headers=auth(STATE["acme"]["token"])).status_code == 404
+
+
+@test
+def test_conversation_delete_authorization():
+    # a conversation exists only via successful chat, which needs an LLM key
+    # the test suite doesn't have — so seed one directly through the db layer
+    from app import db as D
+    cid = D.uid()
+    with D.db() as c:
+        c.execute("INSERT INTO conversations(id,user_id,tenant_id,title) VALUES(?,?,?,?)",
+                  (cid, STATE["apex"]["user"]["id"], STATE["apex"]["user"]["tenant_id"],
+                   "internal notes"))
+    # other org / other user -> 404, and the conversation must survive
+    assert client.delete(f"/api/conversations/{cid}",
+                         headers=auth(STATE["acme"]["token"])).status_code == 404
+    assert client.delete(f"/api/conversations/{uuid.uuid4().hex}",
+                         headers=auth(STATE["apex"]["token"])).status_code == 404
+    assert client.get(f"/api/conversations/{cid}",
+                      headers=auth(STATE["apex"]["token"])).status_code == 200
+    # the owner can delete it
+    assert client.delete(f"/api/conversations/{cid}",
+                         headers=auth(STATE["apex"]["token"])).status_code == 200
+
+
+@test
+def test_search_endpoint_citations_and_isolation():
+    # unauthenticated -> 401; invalid query -> 422
+    assert client.post("/api/search", json={"query": "leave"}).status_code == 401
+    h = auth(STATE["acme"]["token"])
+    assert client.post("/api/search", headers=h, json={"query": ""}).status_code == 422
+
+    # a Finance document whose content WOULD match the query below
+    r = upload(STATE["acme"]["token"], "FinLeak.txt",
+               "Parental leave for contractors is six weeks after probation.",
+               department="Finance & Operations")
+    assert r.status_code == 200, r.text
+    fin_leak = r.json()["id"]
+
+    # HR member searches, trying to smuggle the Finance doc id into the body:
+    # the backend derives its scope from the token, never from client input
+    r = client.post("/api/search", headers=auth(STATE["hr"]["token"]),
+                    json={"query": "parental leave weeks",
+                          "doc_ids": [fin_leak, STATE["handbook"]["id"]]})
+    assert r.status_code == 200, r.text
+    results = r.json()["results"]
+    assert results, "expected own-department hits"
+    top = results[0]
+    assert top["filename"] == "Handbook.txt" and top["doc_id"] == STATE["handbook"]["id"]
+    assert top["page"] >= 1 and "twenty-four weeks" in top["text"]
+    assert fin_leak not in {x["doc_id"] for x in results}
+    assert "FinLeak.txt" not in {x["filename"] for x in results}
+
+    # another organization gets nothing
+    r = client.post("/api/search", headers=auth(STATE["apex"]["token"]),
+                    json={"query": "parental leave weeks"})
+    assert r.status_code == 200 and r.json()["results"] == []
+
+    # searches are recorded in the admin audit trail
+    audit = client.get("/api/admin/audit", headers=h).json()
+    assert "search" in {a["action"] for a in audit}
+
+
+@test
+def test_search_respects_restricted_acl():
+    q = "acquisition target offer ceiling"
+    r = client.post("/api/search", headers=auth(STATE["lena"]["token"]),
+                    json={"query": q})
+    assert r.status_code == 200, r.text
+    assert STATE["secrets"]["id"] in {x["doc_id"] for x in r.json()["results"]}
+    # leo is in the same department but was never granted the ACL
+    r = client.post("/api/search", headers=auth(STATE["leo"]["token"]),
+                    json={"query": q})
+    assert r.status_code == 200
+    assert STATE["secrets"]["id"] not in {x["doc_id"] for x in r.json()["results"]}
+
+
+@test
+def test_malformed_and_oversized_files_rejected():
+    h = auth(STATE["acme"]["token"])
+    before = len(client.get("/api/documents", headers=h).json())
+    # corrupt PDF -> 422 with no orphan row left behind
+    r = client.post("/api/documents", headers=h,
+                    files={"file": ("Corrupt.pdf", b"%PDF-1.4 not really a pdf",
+                                    "application/pdf")},
+                    data={"department": "Human Resources"})
+    assert r.status_code == 422, r.text
+    # above MAX_UPLOAD_MB -> 413
+    r = upload(STATE["acme"]["token"], "Big.txt", "x" * (4 * 1024 * 1024 + 1024))
+    assert r.status_code == 413
+    assert len(client.get("/api/documents", headers=h).json()) == before
+
+
+@test
+def test_org_admin_scope_and_cross_org_boundary():
+    t = auth(STATE["acme"]["token"])
+    # the organization admin sees every document of their own organization,
+    # including other departments' and restricted documents (for management)
+    names = {d["filename"] for d in client.get("/api/documents", headers=t).json()}
+    assert {"Handbook.txt", "Standard.docx", "BoardSecrets.txt"} <= names
+
+    # an admin of another organization manages only their own data
+    apex_t = auth(STATE["apex"]["token"])
+    r = upload(STATE["apex"]["token"], "ApexOnly.txt", "Apex internal roadmap for 2027.")
+    assert r.status_code == 200, r.text
+    apex_doc = r.json()["id"]
+    assert "ApexOnly.txt" not in {d["filename"] for d in client.get("/api/documents", headers=t).json()}
+    assert client.get(f"/api/documents/{apex_doc}/download", headers=t).status_code == 404
+    assert client.delete(f"/api/documents/{apex_doc}", headers=t).status_code == 404
+    assert client.patch(f"/api/documents/{apex_doc}/access", headers=t,
+                        json={"visibility": "organization"}).status_code == 404
+    # retrieval never leaks across organizations either
+    r = client.post("/api/search", headers=t, json={"query": "internal roadmap 2027"})
+    assert r.status_code == 200 and r.json()["results"] == []
+    assert client.get("/api/documents", headers=apex_t).json()  # apex keeps its doc
+    assert "ApexOnly.txt" in {d["filename"] for d in client.get("/api/documents", headers=apex_t).json()}
+
+
+@test
+def test_organization_wide_document():
+    r = upload(STATE["acme"]["token"], "CompanyWide.txt",
+               "All-staff town hall is on the first Friday of every month.",
+               visibility="organization")
+    assert r.status_code == 200, r.text
+    doc = r.json()
+    assert doc["visibility"] == "organization" and doc["department"] == ""
+    STATE["companywide"] = doc
+
+    def names(tok):
+        return {d["filename"] for d in client.get("/api/documents", headers=auth(tok)).json()}
+
+    # members of every department of the organization can see and query it
+    assert "CompanyWide.txt" in names(STATE["hr"]["token"])
+    assert "CompanyWide.txt" in names(STATE["fin"]["token"])
+    assert "CompanyWide.txt" in names(STATE["lena"]["token"])
+    r = client.post("/api/search", headers=auth(STATE["lena"]["token"]),
+                    json={"query": "town hall first Friday"})
+    hits = {x["doc_id"] for x in r.json()["results"]}
+    assert STATE["companywide"]["id"] in hits
+    # but never another organization's documents
+    r = client.post("/api/search", headers=auth(STATE["apex"]["token"]),
+                    json={"query": "town hall first Friday"})
+    assert r.json()["results"] == []
+
+
+@test
+def test_selected_departments_document():
+    t = auth(STATE["acme"]["token"])
+    depts = {d["name"]: d["id"] for d in client.get("/api/departments", headers=t).json()}
+    hr_id, fin_id = depts["Human Resources"], depts["Finance & Operations"]
+    apex_dept = client.get("/api/departments",
+                           headers=auth(STATE["apex"]["token"])).json()[0]["id"]
+
+    body = "Procurement policy: orders above 5000 need CFO sign-off."
+    # validation: at least one target — and only departments of the caller's org
+    r = upload(STATE["acme"]["token"], "Multi.txt", body,
+               visibility="selected_departments")
+    assert r.status_code == 400
+    r = upload(STATE["acme"]["token"], "Multi.txt", body,
+               visibility="selected_departments", dept_ids=f"{hr_id},{apex_dept}")
+    assert r.status_code == 400
+    r = upload(STATE["acme"]["token"], "Multi.txt", body,
+               visibility="selected_departments", dept_ids=f"{hr_id},{fin_id}")
+    assert r.status_code == 200, r.text
+    multi = r.json()
+    assert multi["visibility"] == "selected_departments" and multi["department"] == ""
+    STATE["multi"] = multi
+
+    def names(tok):
+        return {d["filename"] for d in client.get("/api/documents", headers=auth(tok)).json()}
+
+    # (fin_user was moved to Engineering by an earlier test — register a
+    # fresh Finance member so the positive check is unambiguous)
+    inv = client.post("/api/admin/invites", headers=t,
+                      json={"role": "member", "department": "Finance & Operations"})
+    fin2 = client.post("/api/auth/register",
+                       json={"username": "fin_multi", "password": "finpass456",
+                             "invite_code": inv.json()["code"]}).json()
+    STATE["fin2"] = fin2
+    assert "Multi.txt" in names(STATE["hr"]["token"])       # selected
+    assert "Multi.txt" in names(fin2["token"])              # selected (Finance)
+    assert "Multi.txt" not in names(STATE["leo"]["token"])  # not selected
+    assert "Multi.txt" not in names(STATE["apex"]["token"])
+    # the list response exposes the resolved department targets
+    row = next(d for d in client.get("/api/documents", headers=t).json()
+               if d["filename"] == "Multi.txt")
+    assert {d["name"] for d in row["departments"]} == {"Human Resources", "Finance & Operations"}
+    # a selected-department user can query it; an unselected one cannot
+    s = client.post("/api/search", headers=auth(STATE["hr"]["token"]),
+                    json={"query": "procurement CFO sign-off"})
+    assert STATE["multi"]["id"] in {x["doc_id"] for x in s.json()["results"]}
+    s = client.post("/api/search", headers=auth(STATE["leo"]["token"]),
+                    json={"query": "procurement CFO sign-off"})
+    assert STATE["multi"]["id"] not in {x["doc_id"] for x in s.json()["results"]}
+
+
+@test
+def test_download_permission_separate_from_query():
+    r = upload(STATE["acme"]["token"], "NoDown.txt",
+               "Quarterly fire drill happens on Friday at noon.",
+               visibility="organization", download="false")
+    assert r.status_code == 200, r.text
+    nid = r.json()["id"]
+    assert r.json()["download_allowed"] is False
+
+    # members may still QUERY it …
+    s = client.post("/api/search", headers=auth(STATE["hr"]["token"]),
+                    json={"query": "fire drill Friday noon"})
+    assert nid in {x["doc_id"] for x in s.json()["results"]}
+    # … but the download itself is refused
+    dl = client.get(f"/api/documents/{nid}/download", headers=auth(STATE["hr"]["token"]))
+    assert dl.status_code == 403
+    # the organization admin can always download their organization's files
+    assert client.get(f"/api/documents/{nid}/download",
+                      headers=auth(STATE["acme"]["token"])).status_code == 200
+    # explicitly enabling download grants members access
+    r = client.patch(f"/api/documents/{nid}/access", headers=auth(STATE["acme"]["token"]),
+                     json={"visibility": "organization", "download_allowed": True})
+    assert r.status_code == 200
+    assert client.get(f"/api/documents/{nid}/download",
+                      headers=auth(STATE["hr"]["token"])).status_code == 200
+
+
+@test
+def test_access_endpoint_acl_management():
+    t = auth(STATE["acme"]["token"])
+    sid = STATE["secrets"]["id"]
+    lena_id, leo_id = STATE["lena"]["user"]["id"], STATE["leo"]["user"]["id"]
+
+    # grant leo as well — both Legal members can see it now
+    r = client.patch(f"/api/documents/{sid}/access", headers=t,
+                     json={"visibility": "restricted", "allowed_user_ids": [lena_id, leo_id]})
+    assert r.status_code == 200, r.text
+    names = {d["filename"] for d in client.get("/api/documents", headers=auth(STATE["leo"]["token"])).json()}
+    assert "BoardSecrets.txt" in names
+    # revoke leo — access disappears again
+    r = client.patch(f"/api/documents/{sid}/access", headers=t,
+                     json={"visibility": "restricted", "allowed_user_ids": [lena_id]})
+    assert r.status_code == 200
+    names = {d["filename"] for d in client.get("/api/documents", headers=auth(STATE["leo"]["token"])).json()}
+    assert "BoardSecrets.txt" not in names
+    # users of other organizations can never be granted
+    apex_user = client.get("/api/admin/users", headers=auth(STATE["apex"]["token"])).json()[0]["id"]
+    r = client.patch(f"/api/documents/{sid}/access", headers=t,
+                     json={"visibility": "restricted", "allowed_user_ids": [apex_user]})
+    assert r.status_code == 400
+    # members cannot manage permissions at all
+    r = client.patch(f"/api/documents/{sid}/access", headers=auth(STATE["hr"]["token"]),
+                     json={"visibility": "restricted", "allowed_user_ids": []})
+    assert r.status_code == 403
+
+
+@test
+def test_selected_departments_via_access_endpoint_and_legacy_rows():
+    t = auth(STATE["acme"]["token"])
+    depts = {d["name"]: d["id"] for d in client.get("/api/departments", headers=t).json()}
+    # retarget the Engineering document to include HR as well
+    r = client.patch(f"/api/documents/{STATE['standard']['id']}/access", headers=t,
+                     json={"visibility": "selected_departments",
+                           "department_ids": [depts["Engineering & Tech"],
+                                              depts["Human Resources"]]})
+    assert r.status_code == 200, r.text
+    names = {d["filename"] for d in client.get("/api/documents", headers=auth(STATE["hr"]["token"])).json()}
+    assert "Standard.docx" in names            # HR was selected
+    names = {d["filename"] for d in client.get("/api/documents", headers=auth(STATE["leo"]["token"])).json()}
+    assert "Standard.docx" not in names        # Legal was not
+
+    # legacy rows (visibility='org' written by older releases) stay
+    # department-scoped forever — pre-existing access is preserved
+    from app import db as D
+    legacy_id = D.uid()
+    with D.db() as c:
+        c.execute("INSERT INTO documents(id,tenant_id,filename,visibility,department,uploaded_by,chunks)"
+                  " VALUES(?,?,?,?,?,?,?)",
+                  (legacy_id, STATE["acme"]["user"]["tenant_id"], "Legacy.txt", "org",
+                   "Legal & Compliance", STATE["acme"]["user"]["id"], 0))
+    names = {d["filename"] for d in client.get("/api/documents", headers=auth(STATE["leo"]["token"])).json()}
+    assert "Legacy.txt" in names               # same department → visible
+    names = {d["filename"] for d in client.get("/api/documents", headers=auth(STATE["hr"]["token"])).json()}
+    assert "Legacy.txt" not in names           # other department → invisible
+
+
+@test
+def test_manager_designation_defaults_and_admin_toggle():
+    """users.is_manager: additive flag, default 0, toggled only by an admin
+    of the same organization — a workspace gate, not a privilege."""
+    t = auth(STATE["acme"]["token"])
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t).json()}
+    assert users["acme_admin"]["is_manager"] in (0, False)   # default for existing users
+    assert users["hana_hr"]["is_manager"] in (0, False)
+
+    hr_id = users["hana_hr"]["id"]
+    assert client.patch(f"/api/admin/users/{hr_id}", headers=t,
+                        json={"is_manager": True}).status_code == 200
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t).json()}
+    assert users["hana_hr"]["is_manager"] in (1, True)
+    # the session payload reflects it (server-derived; never client-settable)
+    me = client.get("/api/auth/me", headers=auth(STATE["hr"]["token"])).json()
+    assert me["is_manager"] in (1, True)
+    # role/department untouched by the designation change
+    assert me["role"] == "member" and me["department"] == "Human Resources"
+
+    assert client.patch(f"/api/admin/users/{hr_id}", headers=t,
+                        json={"is_manager": False}).status_code == 200
+    me = client.get("/api/auth/me", headers=auth(STATE["hr"]["token"])).json()
+    assert me["is_manager"] in (0, False)
+
+
+@test
+def test_manager_designation_requires_admin_and_stays_in_tenant():
+    # a member cannot change designations (admin endpoint, 403)
+    r = client.patch(f"/api/admin/users/{STATE['acme']['user']['id']}",
+                     headers=auth(STATE["hr"]["token"]), json={"is_manager": True})
+    assert r.status_code == 403
+    # a foreign tenant's user id is invisible to this admin (404, no cross-tenant write)
+    r = client.patch(f"/api/admin/users/{STATE['apex']['user']['id']}",
+                     headers=auth(STATE["acme"]["token"]), json={"is_manager": True})
+    assert r.status_code == 404
+    # ...and the foreign user's designation/session is untouched
+    apex_me = client.get("/api/auth/me", headers=auth(STATE["apex"]["token"])).json()
+    assert apex_me["is_manager"] in (0, False)
+
+
+@test
+def test_team_overview_gated_with_no_new_privileges():
+    t_admin = auth(STATE["acme"]["token"])
+    hr_t = auth(STATE["hr"]["token"])
+
+    # (a) designation required: plain member AND plain admin both get 403
+    assert client.get("/api/team/overview", headers=hr_t).status_code == 403, \
+        "non-manager member must be refused"
+    assert client.get("/api/team/overview", headers=t_admin).status_code == 403, \
+        "role alone must not open the manager workspace"
+
+    # give the HR member a fresh department document to anchor the assertions
+    r = upload(STATE["acme"]["token"], "ManagerGuide.txt",
+               "Team guide used by the manager workspace test.", "department",
+               "Human Resources")
+    assert r.status_code == 200, r.text
+
+    # (b) grant designation → 200, payload stays within the caller's authority
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t_admin).json()}
+    assert client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_admin,
+                        json={"is_manager": True}).status_code == 200
+    r = client.get("/api/team/overview", headers=hr_t)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["department"] == "Human Resources" and body["member_count"] >= 1, body
+    assert body["document_count"] == len(body["documents"]) >= 1, body
+    # every returned document is already visible via the normal listing …
+    listed = {d["id"] for d in client.get("/api/documents", headers=hr_t).json()}
+    team_ids = {d["id"] for d in body["documents"]}
+    assert team_ids <= listed, "team endpoint returned an unauthorized document"
+    # … and confined to the caller's own department or explicitly selected for it
+    # (no cross-department or cross-tenant reach)
+    assert all(d["department"] == "Human Resources"
+               or d["visibility"] == "selected_departments"
+               for d in body["documents"]), body["documents"]
+
+    # (c) cross-tenant: even a designated admin of another org sees only their own
+    apex_t = auth(STATE["apex"]["token"])
+    apex_users = {u["username"]: u
+                  for u in client.get("/api/admin/users", headers=apex_t).json()}
+    apex_admin_id = apex_users[STATE["apex"]["user"]["username"]]["id"]
+    assert client.patch(f"/api/admin/users/{apex_admin_id}", headers=apex_t,
+                        json={"is_manager": True}).status_code == 200
+    r = client.get("/api/team/overview", headers=apex_t)
+    assert r.status_code == 200, r.text
+    names = {d["filename"] for d in r.json()["documents"]}
+    assert "ManagerGuide.txt" not in names      # never leaks into another tenant
+
+    # revoke both designations so later runs start from the default state
+    client.patch(f"/api/admin/users/{apex_admin_id}", headers=apex_t,
+                 json={"is_manager": False})
+    client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_admin,
+                 json={"is_manager": False})
+
+
+@test
+def test_admin_stats_include_storage_bytes():
+    stats = client.get("/api/admin/stats", headers=auth(STATE["acme"]["token"])).json()
+    assert isinstance(stats.get("storage"), int) and stats["storage"] > 0
+    # admin-only, as before
+    assert client.get("/api/admin/stats", headers=auth(STATE["hr"]["token"])).status_code == 403
 
 
 def main():

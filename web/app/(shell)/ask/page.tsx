@@ -1,9 +1,12 @@
 "use client";
 
 /**
- * Ask Documents — chat over the department's indexed documents.
- * Streams nothing (single request); answers are plain text (no source
- * list, no model info) and state plainly when nothing was found.
+ * Ask OmniRAG — chat over the documents you are authorized to access.
+ *
+ * Streams nothing (single request); answers are plain text and the UI states
+ * plainly when nothing was found — abstentions from the verification pipeline
+ * are highlighted, never hidden. Supports deep-links: /ask?c=<id> loads a
+ * conversation, /ask?q=<text> pre-fills and sends a question.
  */
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -11,6 +14,7 @@ import {
   AlertTriangle,
   BookOpenCheck,
   CornerDownLeft,
+  ShieldQuestion,
   Sparkles,
 } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
@@ -26,11 +30,18 @@ const SUGGESTIONS = [
   "How many casual leave days do employees get?",
 ];
 
+/** Known abstention phrasings returned by the backend verification pipeline. */
+function isAbstention(text: string): boolean {
+  const t = text.toLowerCase();
+  return t.includes("couldn't find this") || t.includes("don't contain enough support");
+}
+
 function AskPage() {
   const { user } = useAuth();
   const router = useRouter();
   const search = useSearchParams();
   const convId = search.get("c");
+  const qParam = search.get("q");
 
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
@@ -39,6 +50,10 @@ function AskPage() {
   const [language, setLanguage] = useState("English");
   const [providers, setProviders] = useState<Providers | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  // conversation id created by the current session's first send — its local
+  // transcript is authoritative and must not be clobbered by a refetch race
+  const createdRef = useRef<string | null>(null);
+  const autoSentRef = useRef(false); // send ?q= exactly once (even under StrictMode)
 
   // provider status banner (LLM key presence)
   useEffect(() => {
@@ -52,11 +67,13 @@ function AskPage() {
       setMessages([]);
       return;
     }
+    if (convId === createdRef.current) return; // just created locally — skip refetch
     api
       .get<Message[]>(`/api/conversations/${convId}`)
       .then((m) => alive && setMessages(m))
       .catch((e) => {
         if (e instanceof ApiError && e.status === 404) router.replace("/ask");
+        else if (alive) setError("Could not load this conversation.");
       });
     return () => {
       alive = false;
@@ -83,11 +100,13 @@ function AskPage() {
         });
         setMessages((m) => [...m, { role: "assistant", content: res.answer }]);
         if (!convId && res.conversation_id) {
-          router.replace(`/ask?c=${res.conversation_id}`);
+          createdRef.current = res.conversation_id;
+          router.replace(`/ask?c=${res.conversation_id}`); // also strips ?q=
         }
         window.dispatchEvent(new Event("omnirag:changed")); // refresh sidebar list
       } catch (e) {
         setError(e instanceof ApiError ? e.message : "Request failed — is the backend running?");
+        setMessages((m) => m.slice(0, -1)); // roll back the optimistic user bubble
       } finally {
         setBusy(false);
       }
@@ -95,24 +114,33 @@ function AskPage() {
     [busy, convId, input, language, router],
   );
 
+  // deep-link: /ask?q=… pre-fills the composer and sends once
+  useEffect(() => {
+    if (!qParam || convId || autoSentRef.current) return;
+    autoSentRef.current = true;
+    setInput(qParam);
+    void send(qParam);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [qParam, convId]);
+
   const noLlm = providers !== null && providers.llm.length === 0;
 
   return (
-    <div className="flex h-[calc(100vh-3.25rem)] flex-col lg:h-screen">
+    <div className="flex h-[calc(100vh-4rem)] flex-col overflow-hidden">
       {/* header */}
-      <div className="border-b border-line bg-ink-2/60 px-5 py-4 backdrop-blur sm:px-8">
+      <div className="border-b border-line bg-white px-5 py-4 sm:px-8">
         <div className="mx-auto flex max-w-4xl flex-wrap items-end justify-between gap-3">
           <div>
-            <h1 className="text-xl font-bold text-white">Ask Documents</h1>
+            <h1 className="text-xl font-bold text-slate-900">Ask OmniRAG</h1>
             <p className="mt-0.5 text-sm text-muted">
-              Plain answers drawn only from your department&apos;s documents.
+              Plain answers drawn only from the documents you can access.
             </p>
           </div>
           <div className="flex items-center gap-2">
             <select
               value={language}
               onChange={(e) => setLanguage(e.target.value)}
-              className="rounded-lg border border-line bg-ink-2 px-2.5 py-1.5 text-xs text-slate-300 outline-none focus:border-brand-2"
+              className="rounded-lg border border-line-2 bg-white px-2.5 py-1.5 text-xs text-slate-700 outline-none focus:border-brand-2"
               title="Answer language"
             >
               {LANGUAGES.map((l) => (
@@ -129,7 +157,7 @@ function AskPage() {
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-8">
         <div className="mx-auto max-w-4xl space-y-5">
           {noLlm && (
-            <div className="flex items-start gap-2 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-xs text-amber-200">
+            <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-700">
               <AlertTriangle size={15} className="mt-0.5 shrink-0" />
               <span>
                 No LLM API key is configured on the server, so answers are disabled.
@@ -141,14 +169,14 @@ function AskPage() {
 
           {messages.length === 0 && !busy && (
             <div className="mx-auto max-w-2xl pt-8 text-center">
-              <div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-brand/25 to-accent/25 ring-1 ring-brand/40">
-                <Sparkles size={26} className="text-indigo-300" />
+              <div className="mx-auto grid h-14 w-14 place-items-center rounded-2xl bg-gradient-to-br from-brand/15 to-accent/15 ring-1 ring-brand/25">
+                <Sparkles size={26} className="text-brand-2" />
               </div>
-              <h2 className="mt-4 text-lg font-semibold text-white">
+              <h2 className="mt-4 text-lg font-semibold text-slate-900">
                 Knowledge ready, {user?.username}
               </h2>
               <p className="mt-1 text-sm text-muted">
-                Ask a question about your department&apos;s indexed documents. You get a
+                Ask a question about the documents you are authorized to read. You get a
                 plain answer — and a clear note when the information is not there.
               </p>
               <div className="mt-6 space-y-2.5 text-left">
@@ -156,7 +184,7 @@ function AskPage() {
                   <button
                     key={s}
                     onClick={() => void send(s)}
-                    className="flex w-full items-center gap-3 rounded-xl border border-line bg-panel px-4 py-3 text-sm text-slate-300 transition hover:border-brand-2 hover:text-white"
+                    className="flex w-full items-center gap-3 rounded-xl border border-line bg-white px-4 py-3 text-sm text-slate-700 transition hover:border-brand-2 hover:bg-panel-2"
                   >
                     <BookOpenCheck size={16} className="shrink-0 text-brand-2" />
                     {s}
@@ -169,17 +197,35 @@ function AskPage() {
           {messages.map((m, i) =>
             m.role === "user" ? (
               <div key={i} className="flex justify-end">
-                <div className="max-w-[85%] rounded-2xl rounded-br-md border border-brand/40 bg-brand/15 px-4 py-3 text-sm leading-relaxed text-indigo-100">
+                <div className="max-w-[85%] rounded-2xl rounded-br-md bg-brand px-4 py-3 text-sm leading-relaxed text-white shadow-[0_8px_20px_-14px_rgba(79,70,229,.9)]">
                   {m.content}
                 </div>
               </div>
             ) : (
               <div key={i} className="flex justify-start">
-                <div className="max-w-[92%] rounded-2xl rounded-bl-md border border-line bg-panel px-4 py-3.5">
-                  <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-200">
-                    {m.content}
-                  </p>
-
+                <div className="max-w-[92%]">
+                  <div className="mb-1.5 flex items-center gap-1.5 text-[11px] font-medium text-muted">
+                    <span className="grid h-5 w-5 place-items-center rounded-md bg-gradient-to-br from-brand to-accent">
+                      <Sparkles size={11} className="text-white" />
+                    </span>
+                    OmniRAG
+                  </div>
+                  <div className="rounded-2xl rounded-bl-md border border-line bg-white px-4 py-3.5 shadow-[0_1px_2px_rgba(15,23,42,.05)]">
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800">
+                      {m.content}
+                    </p>
+                    {isAbstention(m.content) && (
+                      <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-700">
+                        <ShieldQuestion size={13} className="mt-0.5 shrink-0" />
+                        <span>
+                          <strong>Verification:</strong> the retrieval pipeline found
+                          insufficient supporting evidence in your accessible documents, so
+                          no answer was generated — this is an intentional abstention, not
+                          an error.
+                        </span>
+                      </div>
+                    )}
+                  </div>
                 </div>
               </div>
             ),
@@ -198,7 +244,7 @@ function AskPage() {
       </div>
 
       {/* composer */}
-      <div className="border-t border-line bg-ink-2/60 px-4 py-4 backdrop-blur sm:px-8">
+      <div className="border-t border-line bg-white px-4 py-4 sm:px-8">
         <form
           className="mx-auto flex max-w-4xl items-end gap-2"
           onSubmit={(e) => {
@@ -217,7 +263,7 @@ function AskPage() {
               }
             }}
             placeholder="Ask anything about your organization's documents…"
-            className="max-h-40 min-h-[52px] flex-1 resize-none rounded-xl border border-line bg-ink px-4 py-3 text-sm text-white placeholder:text-slate-500 outline-none focus:border-brand-2 focus:ring-2 focus:ring-brand/25"
+            className="max-h-40 min-h-[52px] flex-1 resize-none rounded-xl border border-line-2 bg-white px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-brand-2 focus:ring-2 focus:ring-brand/20"
           />
           <button
             type="submit"
@@ -227,8 +273,8 @@ function AskPage() {
             Send <CornerDownLeft size={14} />
           </button>
         </form>
-        <p className="mx-auto mt-2 max-w-4xl text-[10px] text-slate-600">
-          Answers are generated only from documents in your own department. Enter to
+        <p className="mx-auto mt-2 max-w-4xl text-[10px] text-slate-500">
+          Answers are generated only from documents you are authorized to read. Enter to
           send · Shift+Enter for a new line.
         </p>
       </div>

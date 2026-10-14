@@ -18,9 +18,12 @@ in the documents you can access.
   departments, documents, chats and audit trail. Isolation is enforced in
   SQL-level scoping on *every* backend endpoint, not just in the UI.
 - **Roles & departments** — `admin` / `member` roles, five default departments
-  seeded per org, plus custom departments.
-- **Three document visibilities** — organization-wide, department-scoped, or
-  restricted to an explicit user allowlist.
+  seeded per org, plus custom departments. Organization admins manage every
+  document, user and department of their own organization (never another's).
+- **Four document scopes** — organization-wide (all employees), selected
+  departments, one department, or restricted to an explicit user allowlist —
+  plus a **separate download permission** (querying a document never implies
+  the right to download the original file).
 - **Full document lifecycle** — upload, extract, chunk, embed, index, list,
   download and delete for `.pdf .docx .pptx .txt .md .csv .json`.
 - **Hybrid retrieval** — dense vectors (OpenAI/Gemini, when keyed) + BM25,
@@ -33,8 +36,22 @@ in the documents you can access.
 - **Admin console** — employee directory, live role/department changes,
   Company Employee ID issuance (invitations), onboarding register, stats and
   audit trail.
-- **Responsive premium dark UI** — centered login card, sidebar with per-user
-  chat history, works on desktop and mobile.
+- **Role-aware enterprise dashboard** — light workspace with a dark navy
+  sidebar (Lucide icons, collapsible on mobile). `/dashboard` renders an
+  **Organization Overview** for admins (real stats: documents, employees,
+  departments, storage, documents-by-department chart, recent documents and
+  audit activity) and a **personal overview** for members (accessible
+  documents, indexed passages, conversations, suggested questions). Extra
+  spaces are permission-aware: an **HR Workspace** (HR department members and
+  admins) and a **Team Workspace** for designated managers, plus a tabbed
+  **Settings** page (profile, company, departments, members, document access,
+  security). No controls are rendered for actions the backend does not allow.
+- **Manager designation (`users.is_manager`)** — additive, default `0`, set
+  only by an organization admin of the same tenant. It gates the Team
+  workspace (nav, page and `GET /api/team/overview`, which returns 403
+  otherwise) and grants **no** additional document, department or
+  user-management privileges; the payload only contains data the caller can
+  already read.
 
 ## Architecture
 
@@ -80,7 +97,7 @@ browser ──► Next.js (web/)  ──/api rewrite──►  FastAPI (backend/
 │   │   ├── agent.py      # LangGraph planner/retriever/answerer/verifier
 │   │   ├── llm.py        # provider failover
 │   │   └── config.py     # env-driven configuration
-│   ├── tests/test_api.py # 27 end-to-end API checks (no network needed)
+│   ├── tests/test_api.py # 37 end-to-end API checks (no network needed)
 │   ├── requirements.txt
 │   └── .env.example      # copy to .env and fill in
 └── legacy/               # original Vite prototype (superseded, kept for reference)
@@ -148,7 +165,7 @@ Run the API test suite (isolated temp DB, no network, no keys needed):
 
 ```powershell
 cd backend
-python tests/test_api.py        # 27/27: auth, tenant isolation, ACL, retrieval, admin…
+python tests/test_api.py        # 37/37: auth, tenant isolation, ACL, retrieval, admin…
 ```
 
 ## Deploying to Vercel
@@ -178,11 +195,16 @@ python tests/test_api.py        # 27/27: auth, tenant isolation, ACL, retrieval,
 - **Every** list/get/delete/search/conversation endpoint filters by the
   caller's `tenant_id` from the (verified) token — cross-tenant access returns
   404 or empty, never data.
-- Document visibility (`org` / `department` / `restricted` allowlist) is
-  applied inside the retrieval query itself, so answers can never cite a
-  document the asker can't access.
-- Admin endpoints re-check `role == "admin"` server-side; admins can't
-  demote/delete themselves.
+- Document scope (`organization` / `selected_departments` / `department` /
+  `restricted` allowlist) is resolved by one authorization service
+  (`app/authz.py`) from the verified token and applied inside the retrieval
+  query itself, so answers can never cite a document the asker can't access.
+  Legacy `org` rows written by older releases stay department-scoped.
+- Downloading the original file requires view access **and** the document's
+  download permission (admins always may, within their own organization).
+- Admin endpoints re-check `role == "admin"` server-side and are always
+  scoped to the admin's own organization; admins can't demote/delete
+  themselves.
 - No demo/hardcoded credentials anywhere; organizations self-serve. Secrets
   live only in environment variables.
 
@@ -192,10 +214,11 @@ python tests/test_api.py        # 27/27: auth, tenant isolation, ACL, retrieval,
 |------|-----------|
 | Auth | `POST /api/auth/signup-org`, `POST /api/auth/login`, `POST /api/auth/register` (employee ID), `GET /api/auth/me` |
 | Departments | `GET/POST /api/departments`, `DELETE /api/departments/{id}` |
-| Documents | `GET/POST /api/documents` (multipart), `GET /api/documents/{id}/download`, `DELETE /api/documents/{id}` |
+| Documents | `GET/POST /api/documents` (multipart; scopes + `department_ids` + `download_allowed`), `GET /api/documents/{id}/download` (permission-checked), `PATCH /api/documents/{id}/access` (scope, allowlist, download), `DELETE /api/documents/{id}` |
 | Chat | `POST /api/chat`, `GET /api/conversations`, `GET /api/conversations/{id}` |
 | Search | `POST /api/search` (retrieval with citations, no LLM) |
-| Admin | `GET /api/admin/stats`, `GET /api/admin/users`, `PATCH/DELETE /api/admin/users/{id}`, `POST/GET /api/admin/invites`, `GET /api/admin/audit` |
+| Admin | `GET /api/admin/stats` (incl. `storage` bytes), `GET /api/admin/users`, `PATCH/DELETE /api/admin/users/{id}` (role, department, `is_manager`), `POST/GET /api/admin/invites`, `GET /api/admin/audit` |
+| Team | `GET /api/team/overview` (department docs/members for designated managers only — 403 otherwise) |
 | Meta | `GET /api/health`, `GET /api/providers`, `GET /api/docs` |
 
 ## Known limits

@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
-from . import agent, db as D, embeddings as E, llm, rag, security as S
+from . import agent, authz, db as D, embeddings as E, llm, rag, security as S
 from .config import ALLOW_ORG_SIGNUP, ALLOWED_EXT, CORS, DATABASE_URL, MAX_UPLOAD_MB
 
 
@@ -53,7 +53,8 @@ class OrgSignup(BaseModel):
 def _session(user_id):
     with D.db() as c:
         r = c.execute(
-            "SELECT u.id,u.username,u.role,u.tenant_id,u.department,u.employee_id,t.name AS tenant_name "
+            "SELECT u.id,u.username,u.role,u.tenant_id,u.department,u.employee_id,"
+            "u.is_manager,t.name AS tenant_name "
             "FROM users u JOIN tenants t ON t.id=u.tenant_id WHERE u.id=?", (user_id,)).fetchone()
     return {"token": S.make_token(user_id), "user": dict(r)}
 
@@ -115,38 +116,39 @@ def providers(u=Depends(S.current_user)):
     return {"llm": llm.available(), "embeddings": E.available()}
 
 
-# ── Documents (admin writes; reads are ACL- and department-filtered) ────────
-def visible_doc_ids(u) -> list[str]:
-    """Strict department isolation — applied identically to admins and members.
-
-    A document is visible only when it belongs to the caller's own
-    department. 'restricted' documents additionally require an explicit
-    ACL grant. Nothing crosses department lines: no role (not even admin)
-    sees another department's sources, documents, or citations.
-    """
-    with D.db() as c:
-        rows = c.execute(
-            """SELECT id FROM documents
-               WHERE tenant_id=? AND department=?
-                 AND (visibility!='restricted'
-                      OR id IN (SELECT doc_id FROM doc_acl WHERE user_id=?))""",
-            (u["tenant_id"], u.get("department") or "", u["id"]),
-        ).fetchall()
-    return [r["id"] for r in rows]
+# ── Documents (admin writes; reads are scope- and ACL-filtered via authz) ───
+# The authorization rules live in app/authz.py — one consistent service used
+# by listing, retrieval, chat context, citations, download, delete and ACL
+# changes alike.
 
 
 @app.get("/api/documents")
 def list_docs(u=Depends(S.current_user)):
-    ids = visible_doc_ids(u)
+    ids = authz.visible_doc_ids(u)
     if not ids:
         return []
     with D.db() as c:
         docs = [dict(r) for r in c.execute(
             f"""SELECT d.id,d.filename,d.visibility,d.department,d.chunks,d.created,
+                       d.download_allowed,
                        COALESCE(us.username,'removed user') AS uploaded_by
                 FROM documents d LEFT JOIN users us ON us.id=d.uploaded_by
                 WHERE d.id IN ({','.join('?' * len(ids))})
                 ORDER BY d.created DESC""", ids)]
+        for d in docs:
+            d["download_allowed"] = bool(d["download_allowed"])
+        # selected-department targets, resolved to real names for display
+        sel = [d["id"] for d in docs if d["visibility"] == "selected_departments"]
+        if sel:
+            targets: dict[str, list] = {i: [] for i in sel}
+            for r in c.execute(
+                    f"""SELECT dd.doc_id,dp.id,dp.name FROM doc_departments dd
+                        JOIN departments dp ON dp.id=dd.dept_id
+                        WHERE dd.doc_id IN ({','.join('?' * len(sel))})""", sel):
+                targets[r["doc_id"]].append({"id": r["id"], "name": r["name"]})
+            for d in docs:
+                if d["visibility"] == "selected_departments":
+                    d["departments"] = targets.get(d["id"], [])
         if u["role"] == "admin":
             for d in docs:
                 d["allowed_user_ids"] = [r["user_id"] for r in
@@ -156,30 +158,56 @@ def list_docs(u=Depends(S.current_user)):
 
 @app.get("/api/documents/{doc_id}/download")
 def download_doc(doc_id: str, u=Depends(S.current_user)):
-    if doc_id not in visible_doc_ids(u):
+    if doc_id not in authz.visible_doc_ids(u):
         raise HTTPException(404, "Document not found")
+    if not authz.can_download(u, doc_id):
+        raise HTTPException(403, "Downloads are not permitted for this document")
     with D.db() as c:
         r = c.execute("SELECT filename,content FROM documents WHERE id=? AND tenant_id=?",
                       (doc_id, u["tenant_id"])).fetchone()
     if not r or r["content"] is None:
         raise HTTPException(404, "File content not stored for this document")
+    D.audit(u["tenant_id"], u["id"], "doc_downloaded", r["filename"])
     data = bytes(r["content"])
     media = mimetypes.guess_type(r["filename"])[0] or "application/octet-stream"
     return Response(data, media_type=media, headers={
         "Content-Disposition": f'attachment; filename="{r["filename"]}"'})
 
 
+def _resolve_acl_users(c, tenant_id, user_ids):
+    """Validate ACL grant targets against the caller's organization (400 on foreign/unknown)."""
+    out = []
+    for uid in [x for x in user_ids if x]:
+        if not c.execute("SELECT 1 FROM users WHERE id=? AND tenant_id=?", (uid, tenant_id)).fetchone():
+            raise HTTPException(400, "Unknown user (must belong to your organization)")
+        out.append(uid)
+    return out
+
+
 def _set_acl(c, doc_id, tenant_id, user_ids):
     c.execute("DELETE FROM doc_acl WHERE doc_id=?", (doc_id,))
-    for uid in user_ids:
-        # only same-org users may be granted access
-        if not c.execute("SELECT 1 FROM users WHERE id=? AND tenant_id=?", (uid, tenant_id)).fetchone():
-            continue
-        if not c.execute("SELECT 1 FROM doc_acl WHERE doc_id=? AND user_id=?", (doc_id, uid)).fetchone():
-            c.execute("INSERT INTO doc_acl(doc_id,user_id) VALUES(?,?)", (doc_id, uid))
+    for uid in _resolve_acl_users(c, tenant_id, user_ids):
+        c.execute("INSERT INTO doc_acl(doc_id,user_id) VALUES(?,?)", (doc_id, uid))
 
 
-VISIBILITIES = ("org", "department", "restricted")
+def _set_doc_departments(c, doc_id, tenant_id, dept_ids):
+    """Persist selected-department targets; every id must be a real department
+    of the caller's own organization."""
+    c.execute("DELETE FROM doc_departments WHERE doc_id=?", (doc_id,))
+    for did in dept_ids:
+        if not c.execute("SELECT 1 FROM departments WHERE id=? AND tenant_id=?",
+                         (did, tenant_id)).fetchone():
+            raise HTTPException(400, "Unknown department (must belong to your organization)")
+        c.execute("INSERT INTO doc_departments(doc_id,dept_id) VALUES(?,?)", (doc_id, did))
+
+
+VISIBILITIES = ("org", "department", "organization", "selected_departments", "restricted")
+
+
+def _norm_bool(v: str, default=True) -> bool:
+    if v is None or str(v).strip() == "":
+        return default
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 
 @app.post("/api/documents")
@@ -187,7 +215,9 @@ async def upload(
     file: UploadFile = File(...),
     visibility: str = Form("org"),
     department: str = Form(""),
+    department_ids: str = Form(""),
     allowed_user_ids: str = Form(""),
+    download_allowed: str = Form("true"),
     u=Depends(S.admin_user),
 ):
     name = os.path.basename(file.filename or "file")
@@ -195,10 +225,17 @@ async def upload(
         raise HTTPException(400, f"Unsupported type. Allowed: {', '.join(sorted(ALLOWED_EXT))}")
     if visibility not in VISIBILITIES:
         raise HTTPException(400, f"visibility must be one of {', '.join(VISIBILITIES)}")
-    # Strict department isolation: 'org' is kept as an API alias but behaves
-    # exactly like 'department' — nothing is visible outside its department.
+    # legacy alias: "org" keeps its historical (department-scoped) meaning so
+    # existing API callers and old documents are unaffected.
     visibility = "department" if visibility == "org" else visibility
-    department = department.strip() or (u.get("department") or "").strip() or "General"
+    dept_ids = [x for x in department_ids.split(",") if x.strip()]
+    if visibility == "selected_departments" and not dept_ids:
+        raise HTTPException(400, "selected_departments requires at least one department id")
+    # company-wide and multi-department documents belong to no single department
+    if visibility in ("organization", "selected_departments"):
+        department = ""
+    else:
+        department = department.strip() or (u.get("department") or "").strip() or "General"
     data = await file.read()
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB} MB")
@@ -214,9 +251,10 @@ async def upload(
     # key, so the parent row must exist before ingestion inserts its chunks.
     with D.db() as c:
         c.execute(
-            "INSERT INTO documents(id,tenant_id,filename,visibility,department,uploaded_by,chunks,content) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (doc_id, u["tenant_id"], name, visibility, department.strip(), u["id"], 0, data))
+            "INSERT INTO documents(id,tenant_id,filename,visibility,department,uploaded_by,"
+            "chunks,content,download_allowed) VALUES(?,?,?,?,?,?,?,?,?)",
+            (doc_id, u["tenant_id"], name, visibility, department, u["id"], 0, data,
+             1 if _norm_bool(download_allowed) else 0))
 
     def _unstage():
         """Remove the staged row if extraction/ingestion failed."""
@@ -237,37 +275,54 @@ async def upload(
     with D.db() as c:
         c.execute("UPDATE documents SET chunks=? WHERE id=?", (n, doc_id))
         if visibility == "restricted":
-            _set_acl(c, doc_id, u["tenant_id"], [x for x in allowed_user_ids.split(",") if x])
-    D.audit(u["tenant_id"], u["id"], "doc_uploaded", f"{name} ({visibility})")
+            _set_acl(c, doc_id, u["tenant_id"],
+                     [x for x in allowed_user_ids.split(",") if x])
+        if visibility == "selected_departments":
+            _set_doc_departments(c, doc_id, u["tenant_id"], [x.strip() for x in dept_ids])
+    D.audit(u["tenant_id"], u["id"], "doc_uploaded",
+            f"{name} ({visibility}{':' + department if department else ''})")
     return {"id": doc_id, "filename": name, "chunks": n, "visibility": visibility,
-            "department": department.strip()}
+            "department": department,
+            "download_allowed": _norm_bool(download_allowed),
+            "department_ids": [x.strip() for x in dept_ids] if visibility == "selected_departments" else []}
 
 
 class Acl(BaseModel):
     visibility: str
     allowed_user_ids: list[str] = []
+    department_ids: list[str] = []
+    download_allowed: bool = True
 
 
 @app.patch("/api/documents/{doc_id}/access")
 def set_access(doc_id: str, b: Acl, u=Depends(S.admin_user)):
+    """Organization admin grants/revokes document permissions: visibility
+    scope, per-user grants (restricted) and the download permission."""
     if b.visibility not in VISIBILITIES:
         raise HTTPException(400, f"visibility must be one of {', '.join(VISIBILITIES)}")
     visibility = "department" if b.visibility == "org" else b.visibility
-    # department-scoped: only documents of the caller's own department
-    if doc_id not in visible_doc_ids(u):
+    if visibility == "selected_departments" and not b.department_ids:
+        raise HTTPException(400, "selected_departments requires at least one department id")
+    # admins manage their whole organization, so the scope check covers every
+    # org document; other tenants' ids simply 404
+    if doc_id not in authz.visible_doc_ids(u):
         raise HTTPException(404, "Document not found")
     with D.db() as c:
-        c.execute("UPDATE documents SET visibility=? WHERE id=?", (visibility, doc_id))
+        c.execute("UPDATE documents SET visibility=?, download_allowed=? WHERE id=?",
+                  (visibility, 1 if b.download_allowed else 0, doc_id))
         _set_acl(c, doc_id, u["tenant_id"], b.allowed_user_ids if visibility == "restricted" else [])
-    D.audit(u["tenant_id"], u["id"], "doc_access_changed", f"{doc_id}→{visibility}")
+        _set_doc_departments(c, doc_id, u["tenant_id"],
+                             b.department_ids if visibility == "selected_departments" else [])
+    D.audit(u["tenant_id"], u["id"], "doc_access_changed",
+            f"{doc_id}→{visibility} download={'on' if b.download_allowed else 'off'}")
     return {"ok": True}
 
 
 @app.delete("/api/documents/{doc_id}")
 def delete_doc(doc_id: str, u=Depends(S.admin_user)):
-    # strict department isolation: documents outside the caller's own
-    # department behave exactly like missing documents (404, never a leak)
-    if doc_id not in visible_doc_ids(u):
+    # documents outside the caller's own organization behave exactly like
+    # missing documents (404, never a leak)
+    if doc_id not in authz.visible_doc_ids(u):
         raise HTTPException(404, "Document not found")
     with D.db() as c:
         r = c.execute("SELECT filename FROM documents WHERE id=? AND tenant_id=?",
@@ -291,7 +346,10 @@ def list_departments(u=Depends(S.current_user)):
     with D.db() as c:
         rows = c.execute(
             """SELECT d.id,d.name,d.code,d.created,
-                      (SELECT COUNT(*) FROM documents WHERE tenant_id=d.tenant_id AND department=d.name) AS documents,
+                      (SELECT COUNT(*) FROM documents WHERE tenant_id=d.tenant_id
+                         AND department=d.name) +
+                      (SELECT COUNT(*) FROM doc_departments dd WHERE dd.dept_id=d.id)
+                        AS documents,
                       (SELECT COUNT(*) FROM users WHERE tenant_id=d.tenant_id AND department=d.name) AS members
                FROM departments d WHERE d.tenant_id=? ORDER BY d.name""", (u["tenant_id"],)).fetchall()
     out = [dict(r) for r in rows]
@@ -323,8 +381,10 @@ def delete_department(dept_id: str, u=Depends(S.admin_user)):
                       (dept_id, u["tenant_id"])).fetchone()
         if not r:
             raise HTTPException(404, "Department not found")
-        if c.execute("SELECT 1 FROM documents WHERE tenant_id=? AND department=?",
-                     (u["tenant_id"], r["name"])).fetchone():
+        if c.execute("""SELECT 1 FROM documents WHERE tenant_id=? AND department=?
+                        UNION ALL
+                        SELECT 1 FROM doc_departments WHERE dept_id=?""",
+                     (u["tenant_id"], r["name"], dept_id)).fetchone():
             raise HTTPException(400, "Cannot delete: documents are still assigned to this department")
         c.execute("DELETE FROM departments WHERE id=?", (dept_id,))
     D.audit(u["tenant_id"], u["id"], "dept_deleted", r["name"])
@@ -359,22 +419,41 @@ def chat(b: Ask, u=Depends(S.current_user)):
     query_text = f"{b.question} (Answer strictly in {lang})" if lang != "English" else b.question
 
     try:
-        # doc_ids is computed per request → tenant/department isolation inside retrieval
-        res = agent.run(query_text, u["tenant_id"], visible_doc_ids(u), hist, b.provider)
+        # doc_ids is computed per request → tenant/scope isolation inside retrieval
+        res = agent.run(query_text, u["tenant_id"], authz.visible_doc_ids(u), hist, b.provider)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
-    if "couldn't find this" in res.get("answer", "").lower():
+    a = res.get("answer", "").lower()
+    if "couldn't find this" in a or "don't contain enough support" in a:
         localized = {
-            "spanish": "No pude encontrar esta información en los documentos a los que tiene acceso en su departamento. Intente reformular su pregunta o consulte con un administrador.",
-            "hindi": "मुझे उन दस्तावेज़ों में यह जानकारी नहीं मिली जिन तक आपके विभाग की पहुंच है। कृपया अपना प्रश्न दोबारा पूछें या अपने व्यवस्थापक से संपर्क करें।",
-            "french": "Je n'ai pas trouvé ces informations dans les documents auxquels vous avez accès dans votre département.",
+            "spanish": "No pude encontrar esta información en los documentos a los que tiene acceso. Intente reformular su pregunta o consulte con un administrador.",
+            "hindi": "मुझे उन दस्तावेज़ों में यह जानकारी नहीं मिली जिन तक आपकी पहुंच है। कृपया अपना प्रश्न दोबारा पूछें या अपने व्यवस्थापक से संपर्क करें।",
+            "french": "Je n'ai pas trouvé ces informations dans les documents auxquels vous avez accès.",
         }
         for key, text in localized.items():
             if key in lang.lower():
                 res["answer"] = text
 
     res["latency_ms"] = int((time.time() - t0) * 1000)
+
+    # Research telemetry: outcome statistics only (question stored as SHA-256;
+    # no chunk text, no answers, no credentials). Never affects the response.
+    try:
+        D.log_query(u["tenant_id"], u["id"], b.question, {
+            "n_hits": len(res.get("evidence", [])),
+            "retries": res.get("retries", 0),
+            "sufficiency": (res.get("sufficiency") or {}).get("coverage"),
+            "abstained": res.get("abstained", False),
+            "abstain_reason": res.get("abstain_reason", ""),
+            "grounded": res.get("grounded"),
+            "score": res.get("confidence"),
+            "provider": res.get("providers", ""),
+            "trace": res.get("trace", []),
+        }, res["latency_ms"])
+    except Exception as e:
+        print("query_log write failed:", type(e).__name__)
+
     with D.db() as c:
         if cid is None:
             cid = D.uid()
@@ -383,8 +462,8 @@ def chat(b: Ask, u=Depends(S.current_user)):
         c.execute("INSERT INTO messages(conv_id,role,content) VALUES(?,?,?)", (cid, "user", b.question))
         c.execute("INSERT INTO messages(conv_id,role,content,meta) VALUES(?,?,?,?)",
                   (cid, "assistant", res["answer"],
-                   json.dumps({k: res[k] for k in ("grounded", "confidence",
-                                                   "trace", "latency_ms")})))
+                   json.dumps({k: res.get(k) for k in ("grounded", "confidence", "abstained",
+                                                       "retries", "trace", "latency_ms")})))
     D.audit(u["tenant_id"], u["id"], "query", b.question)
     # intentionally minimal: no source list, no model name, no confidence shown
     return {"answer": res["answer"], "conversation_id": cid, "latency_ms": res["latency_ms"]}
@@ -414,8 +493,76 @@ def conversation(cid: str, u=Depends(S.current_user)):
 @app.delete("/api/conversations/{cid}")
 def del_conv(cid: str, u=Depends(S.current_user)):
     with D.db() as c:
+        # 404 (not a silent 200) for conversations the caller doesn't own
+        if not c.execute("SELECT 1 FROM conversations WHERE id=? AND user_id=?",
+                         (cid, u["id"])).fetchone():
+            raise HTTPException(404, "Not found")
         c.execute("DELETE FROM conversations WHERE id=? AND user_id=?", (cid, u["id"]))
     return {"ok": True}
+
+
+# ── Search (retrieval with citations, no LLM) ───────────────────────────────
+class SearchIn(BaseModel):
+    query: str = Field(min_length=2, max_length=2000)
+    k: int = Field(8, ge=1, le=20)
+
+
+@app.post("/api/search")
+def search_docs(b: SearchIn, u=Depends(S.current_user)):
+    """Hybrid retrieval over the caller's visible documents only.
+
+    Citations point at real stored metadata (filename, page, doc_id). The
+    document scope comes from the verified token — client-supplied ids are
+    never accepted, so retrieval filters always run before any content leaves
+    the server.
+    """
+    hits = rag.search(u["tenant_id"], authz.visible_doc_ids(u), b.query, b.k)
+    hits = rag.rerank(b.query, hits, b.k)
+    D.audit(u["tenant_id"], u["id"], "search", b.query)
+    return {"query": b.query, "results": [
+        {"rank": i + 1, "filename": h["meta"]["filename"], "doc_id": h["meta"]["doc_id"],
+         "page": h["meta"]["page"], "score": h["score"], "text": h["text"]}
+        for i, h in enumerate(hits)]}
+
+
+@app.get("/api/team/overview")
+def team_overview(u=Depends(S.current_user)):
+    """Department workspace data for designated managers (users.is_manager=1).
+
+    Enforced server-side: callers without the manager designation get 403, and
+    the designation can only be granted by an admin of the same organization.
+    The payload contains ONLY data the caller can already read through the
+    normal authorization paths — it grants no new document or user privileges.
+    """
+    if not u.get("is_manager"):
+        raise HTTPException(403, "Manager designation required")
+    ids = authz.visible_doc_ids(u)
+    with D.db() as c:
+        dept = c.execute("SELECT id FROM departments WHERE tenant_id=? AND name=?",
+                         (u["tenant_id"], u["department"])).fetchone()
+        members = (c.execute("SELECT COUNT(*) FROM users WHERE tenant_id=? AND department=?",
+                             (u["tenant_id"], u["department"])).fetchone()[0]
+                   if u["department"] else 0)
+        docs = []
+        if ids:
+            ph = ",".join("?" * len(ids))
+            for r in c.execute(
+                    f"""SELECT d.id,d.filename,d.visibility,d.department,d.chunks,d.created,
+                               d.download_allowed,
+                               COALESCE(us.username,'removed user') AS uploaded_by
+                        FROM documents d LEFT JOIN users us ON us.id=d.uploaded_by
+                        WHERE d.id IN ({ph}) AND (
+                              d.department=? OR
+                              (d.visibility='selected_departments' AND EXISTS (
+                                  SELECT 1 FROM doc_departments dd
+                                  WHERE dd.doc_id=d.id AND dd.dept_id=?)))
+                        ORDER BY d.created DESC""",
+                    [*ids, u["department"], dept["id"] if dept else ""]).fetchall():
+                d = dict(r)
+                d["download_allowed"] = bool(d["download_allowed"])
+                docs.append(d)
+    return {"department": u["department"], "member_count": members,
+            "document_count": len(docs), "documents": docs}
 
 
 # ── Admin (always scoped to the admin's own organization) ───────────────────
@@ -423,13 +570,14 @@ def del_conv(cid: str, u=Depends(S.current_user)):
 def users(u=Depends(S.admin_user)):
     with D.db() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id,username,role,department,employee_id,created FROM users "
+            "SELECT id,username,role,department,employee_id,is_manager,created FROM users "
             "WHERE tenant_id=? ORDER BY created", (u["tenant_id"],))]
 
 
 class UserUpdate(BaseModel):
     role: str | None = None
     department: str | None = None
+    is_manager: bool | None = None
 
 
 @app.patch("/api/admin/users/{user_id}")
@@ -448,11 +596,16 @@ def update_user(user_id: str, b: UserUpdate, u=Depends(S.admin_user)):
                 raise HTTPException(400, "Unknown department")
             c.execute("UPDATE users SET department=? WHERE id=? AND tenant_id=?",
                       (b.department or "General", user_id, u["tenant_id"]))
+        if b.is_manager is not None:
+            # Manager designation: workspace gate only. Changing it never
+            # touches role, department, or any document permission.
+            c.execute("UPDATE users SET is_manager=? WHERE id=? AND tenant_id=?",
+                      (1 if b.is_manager else 0, user_id, u["tenant_id"]))
         if b.role is not None:
             c.execute("UPDATE users SET role=? WHERE id=? AND tenant_id=?",
                       (b.role, user_id, u["tenant_id"]))
     D.audit(u["tenant_id"], u["id"], "user_updated",
-            f"{user_id} role={b.role} dept={b.department}")
+            f"{user_id} role={b.role} dept={b.department} manager={b.is_manager}")
     return {"ok": True}
 
 
@@ -537,6 +690,8 @@ def stats(u=Depends(S.admin_user)):
             "documents": q("SELECT COUNT(*) FROM documents WHERE tenant_id=?"),
             "queries": q("SELECT COUNT(*) FROM audit WHERE tenant_id=? AND action='query'"),
             "chunks": q("SELECT COALESCE(SUM(chunks),0) FROM documents WHERE tenant_id=?"),
+            # stored bytes (real, tenant-scoped): SUM of indexed file content
+            "storage": q("SELECT COALESCE(SUM(LENGTH(content)),0) FROM documents WHERE tenant_id=?"),
         }
 
 

@@ -10,7 +10,7 @@ import { Building2, FileText, Plus, Trash2, Users } from "lucide-react";
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { Department } from "@/lib/types";
-import { Badge, Btn, ErrorNote, Field, Panel, inputCls } from "@/components/ui";
+import { Badge, Btn, ErrorNote, Field, PageHeader, Panel, inputCls } from "@/components/ui";
 
 export default function DepartmentsPage() {
   const { user } = useAuth();
@@ -69,21 +69,22 @@ export default function DepartmentsPage() {
 
   return (
     <div className="mx-auto max-w-6xl px-5 py-8 sm:px-8">
-      <div className="mb-6 flex flex-wrap items-end justify-between gap-3">
-        <div>
-          <h1 className="text-xl font-bold text-white">Departments</h1>
-          <p className="mt-1 text-sm text-muted">
-            {isAdmin
-              ? "Manage organization structure. Documents inside each department are visible only to that department — for every role."
-              : `You belong to ${user?.department || "—"} — it is the only department and the only set of documents you can see.`}
-          </p>
-        </div>
-        {isAdmin && (
-          <Btn onClick={() => setShowForm((s) => !s)} variant={showForm ? "secondary" : "primary"}>
-            <Plus size={15} /> {showForm ? "Cancel" : "New Department"}
-          </Btn>
-        )}
-      </div>
+      <PageHeader
+        icon={Building2}
+        title="Departments"
+        subtitle={
+          isAdmin
+            ? "Manage organization structure. Documents inside each department are visible only to that department — for every role."
+            : `You belong to ${user?.department || "—"} — it is the only department and the only set of documents you can see.`
+        }
+        actions={
+          isAdmin ? (
+            <Btn onClick={() => setShowForm((s) => !s)} variant={showForm ? "secondary" : "primary"}>
+              <Plus size={15} /> {showForm ? "Cancel" : "New Department"}
+            </Btn>
+          ) : undefined
+        }
+      />
 
       {showForm && isAdmin && (
         <Panel className="mb-6" title="Create department" icon={Building2}>
@@ -137,11 +138,11 @@ export default function DepartmentsPage() {
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex items-center gap-3">
-                    <span className="grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-brand/25 to-accent/25 ring-1 ring-brand/30">
-                      <Building2 size={20} className="text-indigo-300" />
+                    <span className="grid h-11 w-11 place-items-center rounded-xl bg-gradient-to-br from-brand/10 to-accent/10 ring-1 ring-brand/20">
+                      <Building2 size={20} className="text-brand-2" />
                     </span>
                     <div>
-                      <h3 className="font-semibold leading-tight text-white">{d.name}</h3>
+                      <h3 className="font-semibold leading-tight text-slate-900">{d.name}</h3>
                       <div className="mt-1 flex items-center gap-1.5">
                         <Badge tone="indigo" className="font-mono">
                           {d.code}
@@ -154,7 +155,7 @@ export default function DepartmentsPage() {
                     <button
                       onClick={() => void removeDept(d)}
                       title="Delete department"
-                      className="rounded-lg p-2 text-slate-600 opacity-0 transition hover:bg-red-500/10 hover:text-red-400 group-hover:opacity-100"
+                      className="rounded-lg p-2 text-slate-500 opacity-60 transition hover:bg-red-50 hover:text-red-600 focus-visible:opacity-100 group-hover:opacity-100"
                     >
                       <Trash2 size={15} />
                     </button>
@@ -175,7 +176,7 @@ export default function DepartmentsPage() {
                 {mine ? (
                   <a
                     href="/library"
-                    className="mt-4 border-t border-line pt-3 text-xs font-medium text-indigo-400 transition hover:text-indigo-300"
+                    className="mt-4 border-t border-line pt-3 text-xs font-medium text-brand-2 transition hover:text-brand"
                   >
                     View department documents →
                   </a>

@@ -2,7 +2,8 @@
 
 /**
  * Login / Join with Employee ID / Create Organization.
- * Dark centered card with purple shield brand — mirrors the reference design.
+ * Navy glow backdrop with a white card — same auth APIs as before; the only
+ * new field is a client-side password confirmation (never sent anywhere).
  */
 import { useState, type FormEvent } from "react";
 import { useRouter } from "next/navigation";
@@ -26,6 +27,7 @@ export default function LoginPage() {
   const [tab, setTab] = useState<Tab>("signin");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
+  const [confirm, setConfirm] = useState("");
   const [orgName, setOrgName] = useState("");
   const [invite, setInvite] = useState("");
   const [error, setError] = useState("");
@@ -34,6 +36,11 @@ export default function LoginPage() {
   async function submit(e: FormEvent) {
     e.preventDefault();
     setError("");
+    // client-side confirmation for account creation (no API change)
+    if (tab !== "signin" && password !== confirm) {
+      setError("Passwords do not match.");
+      return;
+    }
     setBusy(true);
     try {
       let session: Session;
@@ -53,7 +60,7 @@ export default function LoginPage() {
         });
       }
       login(session);
-      router.replace("/ask");
+      router.replace("/dashboard");
     } catch (err) {
       setError(err instanceof ApiError ? err.message : "Something went wrong. Is the API running?");
     } finally {
@@ -70,7 +77,7 @@ export default function LoginPage() {
             <ShieldCheck className="text-white" size={28} strokeWidth={2.2} />
           </div>
           <h1 className="mt-4 text-3xl font-bold tracking-tight text-white">OmniRAG</h1>
-          <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-muted">
+          <p className="mt-1.5 max-w-sm text-sm leading-relaxed text-slate-400">
             Enterprise Knowledge Base with Cross-Department Retrieval &amp; Strict Citations
           </p>
         </div>
@@ -86,11 +93,12 @@ export default function LoginPage() {
                 onClick={() => {
                   setTab(t.id);
                   setError("");
+                  setConfirm("");
                 }}
                 className={`-mb-px flex-1 border-b-2 px-2 py-2.5 text-[13px] font-medium transition ${
                   tab === t.id
-                    ? "border-brand-2 text-white"
-                    : "border-transparent text-slate-500 hover:text-slate-300"
+                    ? "border-brand-2 text-brand-2"
+                    : "border-transparent text-slate-500 hover:text-slate-800"
                 }`}
               >
                 {t.label}
@@ -152,6 +160,21 @@ export default function LoginPage() {
                 }
               />
             </Field>
+
+            {tab !== "signin" && (
+              <Field label="Confirm password" hint="Checked in your browser before submitting.">
+                <input
+                  type="password"
+                  className={inputCls}
+                  value={confirm}
+                  onChange={(e) => setConfirm(e.target.value)}
+                  placeholder="Repeat the password"
+                  required
+                  minLength={8}
+                  autoComplete="new-password"
+                />
+              </Field>
+            )}
 
             <ErrorNote>{error}</ErrorNote>
 

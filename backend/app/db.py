@@ -5,8 +5,9 @@ deployments. Local development falls back to a SQLite file so the app runs
 with zero external services. All SQL is written in the common subset of both
 dialects; only the connection setup and the `messages.id` primary key differ.
 """
-import sqlite3, uuid
+import hashlib, json, sqlite3, uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from .config import DB_PATH, DATABASE_URL, DEFAULT_DEPARTMENTS
 
 PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS users(
   role TEXT NOT NULL DEFAULT 'member',
   department TEXT NOT NULL DEFAULT 'General',
   employee_id TEXT,
+  is_manager INTEGER NOT NULL DEFAULT 0,
   created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS invites(
   code TEXT PRIMARY KEY, tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
@@ -116,6 +118,10 @@ CREATE TABLE IF NOT EXISTS documents(
 CREATE TABLE IF NOT EXISTS doc_acl(
   doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
   user_id TEXT NOT NULL, PRIMARY KEY(doc_id, user_id));
+CREATE TABLE IF NOT EXISTS doc_departments(
+  doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+  dept_id TEXT NOT NULL REFERENCES departments(id) ON DELETE CASCADE,
+  PRIMARY KEY(doc_id, dept_id));
 CREATE TABLE IF NOT EXISTS chunks(
   id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, doc_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
   page INTEGER NOT NULL DEFAULT 1, text TEXT NOT NULL, embedding TEXT,
@@ -129,6 +135,13 @@ CREATE TABLE IF NOT EXISTS messages(
 CREATE TABLE IF NOT EXISTS audit(
   id {_M_ID}, tenant_id TEXT, user_id TEXT, action TEXT, detail TEXT,
   created TEXT DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS query_log(
+  id TEXT PRIMARY KEY, ts TEXT NOT NULL,
+  tenant_id TEXT, user_id TEXT, question_sha256 TEXT,
+  n_hits INTEGER, retries INTEGER, sufficiency REAL,
+  abstained INTEGER, abstain_reason TEXT,
+  grounded INTEGER, score INTEGER,
+  provider TEXT, latency_ms INTEGER, trace TEXT);
 CREATE INDEX IF NOT EXISTS idx_documents_tenant ON documents(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_tenant ON chunks(tenant_id);
@@ -142,6 +155,10 @@ _MIGRATIONS = [
     ("invites", "department", "TEXT NOT NULL DEFAULT ''"),
     ("documents", "department", "TEXT NOT NULL DEFAULT ''"),
     ("documents", "content", "BYTEA" if PG else "BLOB"),
+    ("documents", "download_allowed", "INTEGER NOT NULL DEFAULT 1"),
+    # Manager designation: a UI/workspace gate only — grants no extra data,
+    # document or user-management privileges (default 0 for existing users).
+    ("users", "is_manager", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -187,3 +204,29 @@ def audit(tenant_id, user_id, action, detail=""):
             "INSERT INTO audit(tenant_id,user_id,action,detail) VALUES(?,?,?,?)",
             (tenant_id, user_id, action, detail[:300]),
         )
+
+
+def log_query(tenant_id, user_id, question, outcome: dict, latency_ms: int) -> str:
+    """Privacy-preserving retrieval telemetry (research evaluation).
+
+    Only outcome statistics are stored: the question is recorded as a SHA-256
+    digest (never raw text), and no chunk text, answers, API keys or document
+    contents ever reach this table. Used to measure retries, abstentions,
+    verification outcomes and latency.
+    """
+    qid = uid()
+    with db() as c:
+        c.execute(
+            "INSERT INTO query_log(id,ts,tenant_id,user_id,question_sha256,n_hits,retries,"
+            "sufficiency,abstained,abstain_reason,grounded,score,provider,latency_ms,trace)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (qid, datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             tenant_id, user_id,
+             hashlib.sha256(question.encode("utf-8")).hexdigest(),
+             outcome.get("n_hits"), outcome.get("retries"), outcome.get("sufficiency"),
+             1 if outcome.get("abstained") else 0, outcome.get("abstain_reason") or "",
+             None if outcome.get("grounded") is None else int(outcome["grounded"]),
+             outcome.get("score"), outcome.get("provider") or "", latency_ms,
+             json.dumps(outcome.get("trace") or [])[:2000]),
+        )
+    return qid

@@ -1,18 +1,26 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
-   OmniRAG design tokens — premium dark UI with indigo/purple accents
+   OmniRAG design system — enterprise SaaS:
+   dark navy sidebar · soft light workspace · violet/indigo accents.
+
+   Token NAMES are stable (pages/components reference them); the values were
+   flipped from the original all-dark theme to a light workspace with a navy
+   rail, matching the reference dashboard design.
 --------------------------------------------------------------------------- */
 @theme {
-  --color-ink: #070b14; /* page background            */
-  --color-ink-2: #0a101d; /* raised background          */
-  --color-panel: #0e1526; /* card / panel background    */
-  --color-panel-2: #121b30; /* hover / nested panel       */
-  --color-line: #1d2842; /* borders                    */
-  --color-line-2: #2b3b60; /* stronger borders           */
-  --color-brand: #4f46e5; /* indigo-600 primary         */
-  --color-brand-2: #6366f1; /* indigo-500                 */
-  --color-accent: #7c3aed; /* purple accent              */
+  --color-ink: #f6f7fb; /* workspace page background   */
+  --color-ink-2: #ffffff; /* raised: topbar, inputs      */
+  --color-panel: #ffffff; /* card / panel background     */
+  --color-panel-2: #f1f3f9; /* hover / nested panel        */
+  --color-line: #e5e8f0; /* borders                     */
+  --color-line-2: #d4d9e8; /* stronger borders            */
+  --color-brand: #4f46e5; /* indigo-600 primary          */
+  --color-brand-2: #6366f1; /* indigo-500                  */
+  --color-accent: #7c3aed; /* purple accent               */
+  --color-navy: #0b1220; /* sidebar background          */
+  --color-navy-2: #131d33; /* sidebar raised / hover      */
+  --color-navy-line: #1e293b; /* sidebar borders            */
   --font-sans: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas,
@@ -26,13 +34,13 @@
   }
   body {
     background-color: var(--color-ink);
-    color: #cbd5e1;
+    color: #334155;
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
   }
   ::selection {
-    background: rgba(99, 102, 241, 0.35);
-    color: #fff;
+    background: rgba(99, 102, 241, 0.25);
+    color: #1e1b4b;
   }
   input,
   select,
@@ -40,17 +48,27 @@
   button {
     font: inherit;
   }
-  /* dark, slim scrollbars */
+  /* accessible keyboard focus indicator (inputs use their own ring instead) */
+  :focus-visible {
+    outline: 2px solid var(--color-brand-2);
+    outline-offset: 2px;
+  }
+  input:focus-visible,
+  select:focus-visible,
+  textarea:focus-visible {
+    outline: none;
+  }
+  /* slim light scrollbars */
   * {
     scrollbar-width: thin;
-    scrollbar-color: #2b3b60 transparent;
+    scrollbar-color: #cbd5e1 transparent;
   }
   *::-webkit-scrollbar {
     width: 8px;
     height: 8px;
   }
   *::-webkit-scrollbar-thumb {
-    background: #2b3b60;
+    background: #cbd5e1;
     border-radius: 8px;
   }
   *::-webkit-scrollbar-track {
@@ -59,12 +77,12 @@
 }
 
 @layer utilities {
-  /* subtle radial glow used behind the login card */
+  /* deep navy backdrop with indigo glows — used behind the auth card */
   .glow-bg {
     background:
-      radial-gradient(900px 500px at 15% -10%, rgba(79, 70, 229, 0.18), transparent 60%),
-      radial-gradient(800px 500px at 90% 110%, rgba(124, 58, 237, 0.14), transparent 60%),
-      var(--color-ink);
+      radial-gradient(900px 500px at 15% -10%, rgba(99, 102, 241, 0.28), transparent 60%),
+      radial-gradient(800px 500px at 90% 110%, rgba(124, 58, 237, 0.22), transparent 60%),
+      var(--color-navy);
   }
   .panel {
     background-color: var(--color-panel);
@@ -72,6 +90,6 @@
     border-radius: 1rem;
   }
   .text-muted {
-    color: #94a3b8;
+    color: #64748b;
   }
 }
