@@ -43,7 +43,7 @@ ALLOWED_EXT = {".pdf", ".docx", ".pptx", ".txt", ".md", ".csv", ".json"}
 
 KEYS = {p: os.getenv(f"{p.upper()}_API_KEY", "") for p in ("groq", "openai", "anthropic", "gemini")}
 MODELS = {
-    "groq": os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile"),
+    "groq": os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
     "openai": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
     "anthropic": os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
     "gemini": os.getenv("GEMINI_MODEL", "gemini-2.0-flash"),
