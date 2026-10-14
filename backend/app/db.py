@@ -18,8 +18,36 @@ PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 if PG:
     import psycopg
 
+    class _Row(tuple):
+        """sqlite3.Row-compatible row: r['col'], r[i], dict(r), r.keys(), len, iteration."""
+        # No __slots__: tuple subclasses reject non-empty __slots__
+        # (TypeError at class creation on every CPython) — _keys lives in __dict__.
+        def __new__(cls, values, keys):
+            obj = super().__new__(cls, values)
+            obj._keys = tuple(keys)
+            return obj
+
+        def __getitem__(self, key):
+            if isinstance(key, str):
+                try:
+                    return tuple.__getitem__(self, self._keys.index(key))
+                except ValueError:
+                    raise KeyError(key)
+            return tuple.__getitem__(self, key)
+
+        def keys(self):
+            return self._keys
+
+    def _row_factory(cur):
+        # psycopg RowFactory protocol — (cursor) -> RowMaker(values); identical in
+        # 3.1, 3.2 and 3.3 (all allowed by requirements.txt). Called when the cursor
+        # receives a result, so cur.description is set.
+        names = tuple(d.name for d in cur.description) if cur.description else ()
+        return lambda values: _Row(values, names)
+
     def _connect():
         conn = psycopg.connect(DATABASE_URL, connect_timeout=10)
+        conn.row_factory = _row_factory
         conn.autocommit = False
         return conn
 else:
