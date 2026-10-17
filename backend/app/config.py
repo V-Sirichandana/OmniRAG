@@ -35,7 +35,7 @@ MIN_RERANK = float(os.getenv("MIN_RERANK_SCORE", "0.05"))
 # Evidence-sufficiency gate (agent): minimum fraction of the question's content
 # terms that must appear in the retrieved evidence before generation is
 # attempted. Deterministic and LLM-free — see app/rag.py::sufficiency.
-MIN_EVIDENCE_COVERAGE = float(os.getenv("MIN_EVIDENCE_COVERAGE", "0.34"))
+MIN_EVIDENCE_COVERAGE = float(os.getenv("MIN_EVIDENCE_COVERAGE", "0.30"))
 
 # Vercel Functions accept at most ~4.5 MB per request body.
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "4"))

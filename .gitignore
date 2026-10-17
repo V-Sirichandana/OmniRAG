@@ -1,6 +1,7 @@
 # --- dependencies / build output ---
 node_modules/
 .next/
+*.tsbuildinfo
 dist/
 __pycache__/
 *.pyc

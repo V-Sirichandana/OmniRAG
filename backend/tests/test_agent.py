@@ -17,6 +17,10 @@ or API keys. Covers:
   * prompt-injection text treated as untrusted data
   * telemetry rows (question stored as SHA-256, never raw)
   * the frozen baseline keeps its old semantics (for the A/B evaluation)
+  * false-abstention regression (audit fix): a paraphrase of a documented fact
+    must ANSWER instead of abstaining when the document lacks the question's
+    phrasing, while unrelated unanswerable questions still abstain with zero
+    generation calls (calibrated 0.30 evidence gate)
 """
 import hashlib
 import os
@@ -130,6 +134,13 @@ VAC = _doc("Human Resources", "Vacation.txt", VACATION_DOC)
 DEPLOY = _doc("Engineering & Tech", "Deploy.txt", DEPLOY_DOC)
 INJ = _doc("Human Resources", "Notice.txt", INJECTION_DOC)
 
+# False-abstention regression fixture (audit §B): names the project but never
+# uses the question's phrasing ("title"/"major") — purely synthetic, tenant T1.
+PROJECT_DOC = ("Project Charter: The TestVault Collaborative Platform is the internal "
+               "engineering initiative for secure document collaboration. "
+               "The engineering team owns the roadmap and quarterly deliverables.")
+PROJ = _doc("Human Resources", "ProjectCharter.txt", PROJECT_DOC)
+
 
 def _reset_llm(answer="Stub answer.", verify='{"grounded": true, "score": 90, "unsupported": []}',
                rewriter="general policy overview"):
@@ -178,6 +189,23 @@ def test_supported_answer_from_authorized_document():
     assert res["sufficiency"]["coverage"] >= MIN_EVIDENCE_COVERAGE, res["sufficiency"]
     assert any(e["doc_id"] == VAC for e in res["evidence"]), res["evidence"]
 
+@test
+def test_project_title_paraphrases_pass_sufficiency_gate():
+    project_doc = (
+        "Major project title: Secure Multi-Tenant RAG Platform "
+        "for Enterprise Knowledge Retrieval."
+    )
+    questions = [
+        "what is the project name",
+        "what is the title of the major project",
+    ]
+
+    for question in questions:
+        result = rag.sufficiency(question, [{"text": project_doc}])
+        assert result["coverage"] >= MIN_EVIDENCE_COVERAGE, (
+            f"Question failed evidence gate: {question}; "
+            f"coverage={result['coverage']}"
+        )
 
 @test
 def test_unanswerable_abstains_without_generation():
@@ -308,6 +336,79 @@ def test_baseline_keeps_old_semantics_for_ab():
     _reset_llm()
     base = _run_as("hr_member", "Zymurgy quantics frobnicates?", baseline=True)
     assert base["abstained"] is True and "couldn't find this" in base["answer"].lower(), base
+
+
+@test
+def test_threshold_boundaries_at_calibrated_gate():
+    """1/3 passes, 1/4 fails, 0/3 fails.
+
+    Pins MIN_EVIDENCE_COVERAGE inside the calibrated window (0.25, 1/3]: a
+    0.34 default fails the first boundary (the production false abstention),
+    and a further-lowered default (<= 0.25) fails the window assertion — the
+    gate may be calibrated, never gutted.
+    """
+    assert 0.25 < MIN_EVIDENCE_COVERAGE <= 1 / 3, MIN_EVIDENCE_COVERAGE
+    ev = [{"text": "alpha zulu"}]                       # evidence tokens: {alpha, zulu}
+    s13 = rag.sufficiency("alpha bravo charlie", ev)     # 1/3
+    s14 = rag.sufficiency("alpha bravo charlie delta", ev)  # 1/4
+    s03 = rag.sufficiency("echo foxtrot golf", ev)       # 0/3
+    assert s13["coverage"] == 0.3333 and s13["coverage"] >= MIN_EVIDENCE_COVERAGE, s13
+    assert s14["coverage"] == 0.25 and s14["coverage"] < MIN_EVIDENCE_COVERAGE, s14
+    assert s03["coverage"] == 0.0 and s03["coverage"] < MIN_EVIDENCE_COVERAGE, s03
+
+
+@test
+def test_paraphrase_pair_answers_from_same_project_doc():
+    """False-abstention regression (production incident, audit §B): both the
+    plain and the paraphrased question must ANSWER from the same document —
+    a document that names the project but contains neither 'title' nor 'major'.
+    Runs the full agent graph: answer text, evidence scope and abstention are
+    all asserted, not just the sufficiency ratio.
+    """
+    low = PROJECT_DOC.lower()
+    assert "title" not in low and "major" not in low, "fixture must lack the question's phrasing"
+    assert PROJ in authz.visible_doc_ids(USERS["hr_member"]), "fixture must be in member scope"
+
+    ans = "The project is called the TestVault Collaborative Platform."
+    _reset_llm(answer=ans)
+    res_a = _run_as("hr_member", "what is the project name")
+    gen_a = [c for c in CALLS if _is_answer_call(c["system"])]
+    _reset_llm(answer=ans)
+    res_b = _run_as("hr_member", "what is the title of the major project")
+    gen_b = [c for c in CALLS if _is_answer_call(c["system"])]
+
+    for label, res, gen in (("plain", res_a, gen_a), ("paraphrased", res_b, gen_b)):
+        assert res["abstained"] is False, (label, res)
+        assert res["grounded"] is True and res["retries"] == 0, (label, res)
+        assert "TestVault Collaborative Platform" in res["answer"], (label, res["answer"])
+        assert any(e["doc_id"] == PROJ for e in res["evidence"]), (label, res["evidence"])
+        assert res["sufficiency"]["coverage"] >= MIN_EVIDENCE_COVERAGE, (label, res["sufficiency"])
+        assert gen, (label, "generation must be attempted")
+        for c in gen:   # the authorized project document must be in the grounding context
+            assert "TestVault Collaborative Platform" in c["prompt"], (label, "gold doc missing from prompt")
+    # the paraphrase is the thin-evidence case: only 'project' of its three
+    # content terms exists anywhere in the corpus — 1/3 must clear the gate.
+    assert res_b["sufficiency"]["coverage"] == 0.3333, res_b["sufficiency"]
+    assert res_a["sufficiency"]["coverage"] >= 0.5, res_a["sufficiency"]
+
+
+@test
+def test_unanswerable_questions_still_abstain_without_generation():
+    """Preserved abstention under the calibrated gate: questions that share only
+    one incidental corpus word ('office') at 1/5 and 1/4 coverage must still
+    abstain through the full graph, with the answer model never called.
+    """
+    for q in ("What is the office parking permit fee schedule?",   # 1/5 coverage
+              "What is the office parking permit schedule?"):      # 1/4 coverage
+        _reset_llm()
+        res = _run_as("hr_member", q)
+        assert res["abstained"] is True, (q, res)
+        assert res["abstain_reason"] in ("no_evidence", "insufficient_evidence"), (q, res)
+        assert "couldn't find this" in res["answer"].lower(), (q, res["answer"])
+        assert res["retries"] == 1, (q, res)                       # exactly one controlled retry
+        assert res["sufficiency"]["coverage"] < MIN_EVIDENCE_COVERAGE, (q, res["sufficiency"])
+        assert not any(_is_answer_call(c["system"]) for c in CALLS), \
+            (q, "the answer model must not be called for an unanswerable question")
 
 
 def main():
