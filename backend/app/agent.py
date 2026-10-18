@@ -21,8 +21,8 @@ Evidence-verification contract enforced by this graph:
 import json, re
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
-from . import rag, llm
-from .config import MIN_EVIDENCE_COVERAGE, MIN_RERANK
+from . import db as D, rag, llm
+from .config import MIN_EVIDENCE_COVERAGE, MIN_RERANK, MAX_IDENTITY_CHUNKS
 
 NOT_FOUND = ("I couldn't find this in the documents you have access to. "
              "Try rephrasing, or ask an administrator to upload the relevant document.")
@@ -71,6 +71,64 @@ def plan(s: S):
     except Exception: qs, p = [q], None
     return {"queries": list(dict.fromkeys([q] + qs)), "trace": _log(s, f"plan: {len(qs)} sub-queries")}
 
+def _identity_chunks(tid: str, doc_ids: list) -> list[dict]:
+    """The first chunk (cover/title page) of every authorized document.
+
+    Cover pages carry identity facts — project titles, guide/mentor names —
+    that sparse BM25 retrieval cannot reach when the question's wording does
+    not match the document's ('Giude' for 'Guide', one-word 'Ramchandra',
+    'Platform' instead of 'project'; production guide-question incident).
+    These chunks are APPENDED after the ranked results: ranked order, the
+    rerank score threshold and the sufficiency gate (assess) are untouched,
+    and the scope is exactly the caller's authorized ``doc_ids`` plus
+    ``tid`` — authorization can never widen here. Documents without chunks
+    are skipped.
+
+    A document's first chunk is chosen by NUMERIC ``(page, index)`` order:
+    lexicographic chunk-id order would return ``<doc>:10:0`` before
+    ``<doc>:1:0``. ``retrieve()`` caps how many of these are appended at
+    ``config.MAX_IDENTITY_CHUNKS`` (default 3, ranked hits always first).
+    """
+    if not doc_ids:
+        return []
+    first: dict[str, tuple] = {}          # doc_id -> ((page, index), chunk_id)
+    for i in range(0, len(doc_ids), 400):  # stay under statement parameter limits
+        part = doc_ids[i:i + 400]
+        with D.db() as c:
+            rows = c.execute(
+                f"SELECT id, page, doc_id FROM chunks "
+                f"WHERE tenant_id=? AND doc_id IN ({','.join('?' * len(part))})",
+                (tid, *part),
+            ).fetchall()
+        for r in rows:
+            cid = r["id"]
+            try:
+                idx = int(str(cid).rsplit(":", 1)[1])   # "<doc_id>:<page>:<index>"
+            except (IndexError, ValueError):
+                continue
+            key = (r["page"], idx)
+            best = first.get(r["doc_id"])
+            if best is None or key < best[0]:
+                first[r["doc_id"]] = (key, cid)
+    if not first:
+        return []
+    ids = [first[d][1] for d in dict.fromkeys(doc_ids) if d in first]  # caller order
+    out: dict[str, dict] = {}
+    for i in range(0, len(ids), 400):
+        part = ids[i:i + 400]
+        with D.db() as c:
+            rows = c.execute(
+                f"SELECT ch.id, ch.text, ch.page, ch.doc_id, d.filename "
+                f"FROM chunks ch JOIN documents d ON d.id=ch.doc_id "
+                f"WHERE ch.tenant_id=? AND ch.id IN ({','.join('?' * len(part))})",
+                (tid, *part),
+            ).fetchall()
+        for r in rows:
+            out[r["id"]] = {"id": r["id"], "text": r["text"], "score": None,
+                            "meta": {"doc_id": r["doc_id"], "filename": r["filename"],
+                                     "page": r["page"]}}
+    return [out[cid] for cid in ids if cid in out]   # deterministic caller order
+
 def retrieve(s: S):
     k = 8 if s.get("retries", 0) == 0 else 12
     pool = {}
@@ -78,7 +136,26 @@ def retrieve(s: S):
         for h in rag.search(s["tenant_id"], s["doc_ids"], q, k): pool[h["id"]] = h
     hits = rag.rerank(s["question"], list(pool.values()), 6 if k == 8 else 8)
     hits = [h for h in hits if h["score"] is None or h["score"] >= MIN_RERANK]
-    return {"hits": hits, "trace": _log(s, f"retrieve: {len(hits)} passages kept")}
+    # Append authorized documents' cover chunks (deduped by chunk id, against
+    # the ranked hits AND against each other) so identity facts stay reachable
+    # even when no query token matches them. Ranked results always come first
+    # and are never capped; at most MAX_IDENTITY_CHUNKS covers are appended.
+    # Only when retrieval actually returned something: with zero ranked hits
+    # the agent must keep its original no-evidence semantics (the frozen
+    # baseline of the A/B evaluation and the gate both depend on it).
+    extra = []
+    if hits and MAX_IDENTITY_CHUNKS:
+        seen = {h["id"] for h in hits}
+        for h in _identity_chunks(s["tenant_id"], s.get("doc_ids") or []):
+            if h["id"] in seen:
+                continue
+            seen.add(h["id"])                 # also guards against dup doc_ids
+            extra.append(h)
+            if len(extra) >= MAX_IDENTITY_CHUNKS:
+                break
+    return {"hits": hits + extra,
+            "trace": _log(s, f"retrieve: {len(hits) + len(extra)} passages kept"
+                             + (f" (+{len(extra)} identity)" if extra else ""))}
 
 def assess(s: S):
     """Deterministic sufficiency gate — runs BEFORE any answer generation."""

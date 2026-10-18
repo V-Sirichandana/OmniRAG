@@ -21,6 +21,11 @@ or API keys. Covers:
     must ANSWER instead of abstaining when the document lacks the question's
     phrasing, while unrelated unanswerable questions still abstain with zero
     generation calls (calibrated 0.30 evidence gate)
+  * identity-chunk reachability: each authorized document's cover chunk is
+    appended after the ranked evidence (numeric page/index order, deduped,
+    tenant/scope-locked, capped at config.MAX_IDENTITY_CHUNKS), so
+    'Giude/Mentor' cover facts answer while the sufficiency gate and
+    abstention contracts stay intact
 """
 import hashlib
 import os
@@ -44,7 +49,7 @@ os.environ["EMBED_PROVIDER"] = "none"      # BM25-only retrieval in tests
 from fastapi.testclient import TestClient  # noqa: E402
 
 from app import agent, authz, db as D, llm, rag, security as S  # noqa: E402
-from app.config import MIN_EVIDENCE_COVERAGE  # noqa: E402
+from app.config import MIN_EVIDENCE_COVERAGE, MAX_IDENTITY_CHUNKS  # noqa: E402
 from app.main import app  # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -409,6 +414,234 @@ def test_unanswerable_questions_still_abstain_without_generation():
         assert res["sufficiency"]["coverage"] < MIN_EVIDENCE_COVERAGE, (q, res["sufficiency"])
         assert not any(_is_answer_call(c["system"]) for c in CALLS), \
             (q, "the answer model must not be called for an unanswerable question")
+
+
+# ---------------------------------------------------------------------------
+# Identity-chunk reachability (production guide-question regression)
+# ---------------------------------------------------------------------------
+GUIDE_Q = "what is the name of guide in project"
+
+
+@test
+def test_misspelled_guide_question_reaches_identity_chunk():
+    """Production incident: the cover page says 'Giude/Mentor: Dr. S.
+    Ramchandra Reddy' — none of the question's tokens ('name'/'guide'/
+    'project') appear on it, so BM25's candidate filter (rag.py) never ranks
+    it at any k. Without the identity append the answer model saw only body
+    chunks and replied that the documents do not contain the guide's name.
+    The gate must still pass on the body evidence (unchanged math), and the
+    cover chunk must reach the generation context."""
+    cover = ("Giude/Mentor: Dr. S. Ramchandra Reddy. Presented By: 23B61A7260 "
+             "V. Siri Chandana, 23B61A7221 D. Maha Lakshmi. Department of Artificial "
+             "Intelligence and Data Science, Autonomous Engineering College. Secure multi "
+             "tenant retrieval augmented generation platform architecture overview.")
+    body = ("Project Charter: the secure retrieval augmented generation platform organizes "
+            "enterprise knowledge for every department. Engineering teams define the "
+            "architecture, the retrieval pipeline and the ranking algorithm, while operators "
+            "maintain the deployment environment, the monitoring dashboards and the release "
+            "checklist. Integration work covers authentication, logging, storage, testing and "
+            "documentation, with quarterly deliverables tracked by the steering committee and "
+            "reviewed every sprint by the assigned reviewers. Additional scope covers training "
+            "workshops, quality assurance, performance benchmarking and capacity planning "
+            "across all regions.")
+    guide_doc = _doc("Human Resources", "Cover.txt", cover + "\n" + body)
+
+    # -- fixture fidelity: cover and body must be separate chunks --------------
+    with D.db() as c:
+        rows = [dict(r) for r in c.execute(
+            "SELECT id, text FROM chunks WHERE doc_id=?", (guide_doc,))]
+    assert len(rows) >= 2, f"cover/body must split into separate chunks, got {len(rows)}"
+    ident = agent._identity_chunks(T1, [guide_doc])
+    assert len(ident) == 1 and ident[0]["id"] == f"{guide_doc}:1:0", ident
+    cover_chunk = ident[0]
+    assert "Giude/Mentor" in cover_chunk["text"] and "Ramchandra" in cover_chunk["text"]
+    others = [r for r in rows if r["id"] != cover_chunk["id"]]
+    assert all("Ramchandra" not in r["text"] for r in others), \
+        "only the cover chunk may carry the guide's name"
+    # no query token (len>=3, stopwords included as BM25 does) is shared with
+    # the cover -> lexically unreachable, exactly like production
+    q_toks = {t for t in rag._tok(GUIDE_Q) if len(t) >= 3}
+    c_toks = {t for t in rag._tok(cover_chunk["text"]) if len(t) >= 3}
+    assert not (q_toks & c_toks), f"fixture must be lexically unreachable: {q_toks & c_toks}"
+    ranked = rag.search(T1, authz.visible_doc_ids(USERS["hr_member"]), GUIDE_Q, 8)
+    assert cover_chunk["id"] not in [h["id"] for h in ranked], \
+        "cover must not be a BM25 candidate (otherwise the fix isn't exercised)"
+
+    # -- full graph ------------------------------------------------------------
+    _reset_llm(answer="The guide is Dr. S. Ramchandra Reddy.")
+    res = _run_as("hr_member", GUIDE_Q)
+    assert res["abstained"] is False, res
+    assert res["retries"] == 0, f"gate must pass on body evidence without a retry: {res}"
+    # gate math unchanged: only 'project' of {name, guide, project} matches —
+    # the appended cover contributes no query terms and cannot open the gate
+    assert res["sufficiency"]["coverage"] == 0.3333, res["sufficiency"]
+    assert res["sufficiency"]["coverage"] >= MIN_EVIDENCE_COVERAGE, res["sufficiency"]
+    ev_ids = [e["chunk_id"] for e in res["evidence"]]
+    assert cover_chunk["id"] in ev_ids, (cover_chunk["id"], ev_ids)
+    assert guide_doc in [e["doc_id"] for e in res["evidence"]], res["evidence"]
+    gen = [c for c in CALLS if _is_answer_call(c["system"])]
+    assert gen, "generation must be attempted"
+    for c in gen:
+        assert "Giude/Mentor" in c["prompt"], "cover chunk missing from generation context"
+        assert "Ramchandra" in c["prompt"], "guide's name missing from generation context"
+
+
+@test
+def test_identity_chunks_do_not_bypass_sufficiency_gate():
+    """The identity append must not weaken abstention: even though the cover
+    chunks ARE part of the evidence pool, an unanswerable question still
+    abstains through the full graph after exactly one retry, with the answer
+    model never called — zero-overlap (coverage 0.0) and incidental-overlap
+    (single stray corpus word) cases alike."""
+    ident_ids = {h["id"] for h in agent._identity_chunks(
+        T1, authz.visible_doc_ids(USERS["hr_member"]))}
+    assert ident_ids, "scope must contain identity chunks for this assertion to mean anything"
+
+    for q, expect in (("What is the zymurgy quantics frobnication budget?", 0.0),
+                      ("What is the office parking permit fee schedule?", None)):
+        _reset_llm()
+        res = _run_as("hr_member", q)
+        assert res["abstained"] is True, (q, res)
+        assert res["abstain_reason"] in ("no_evidence", "insufficient_evidence"), (q, res)
+        assert "couldn't find this" in res["answer"].lower(), (q, res["answer"])
+        assert res["retries"] == 1, (q, res)
+        assert res["sufficiency"]["coverage"] < MIN_EVIDENCE_COVERAGE, (q, res["sufficiency"])
+        if expect is not None:
+            assert res["sufficiency"]["coverage"] == expect, (q, res["sufficiency"])
+        # identity chunks WERE appended (within the cap) — and still did not
+        # open the gate: presence of cover text never buys a pass
+        ev_ids = {e["chunk_id"] for e in res["evidence"]}
+        ident_in_ev = ident_ids & ev_ids
+        assert ident_in_ev, (q, "identity chunks should be appended when ranked hits exist")
+        appended = [int(t.split("(+")[1].split(" ")[0]) for t in res["trace"]
+                    if "(+" in t and " identity)" in t]
+        assert appended, (q, "expected an identity-append trace marker")
+        assert all(n <= MAX_IDENTITY_CHUNKS for n in appended), (q, appended)
+        assert not any(_is_answer_call(c["system"]) for c in CALLS), \
+            (q, "the answer model must not be called for an unanswerable question")
+
+
+@test
+def test_identity_chunk_selected_by_numeric_page_order():
+    """A 10+-page document: lexicographic chunk-id order returns '<doc>:10:0'
+    BEFORE '<doc>:1:0' — selection must use numeric (page, index). Also pins
+    that chunkless documents in scope are skipped, and that the append runs
+    inside retrieve() itself."""
+    doc_id = D.uid()
+    with D.db() as c:
+        c.execute("INSERT INTO documents(id,tenant_id,filename,visibility,department,uploaded_by,chunks)"
+                  " VALUES(?,?,?,?,?,?,?)",
+                  (doc_id, T1, "TwelvePage.txt", "restricted", "", "test", 5))
+        for page in (1, 2, 10, 11, 12):
+            text = ("Cover sheet opening page for the twelve page document." if page == 1
+                    else f"Section marker page {page} unique text.")
+            c.execute("INSERT INTO chunks(id,tenant_id,doc_id,page,text,embedding) VALUES(?,?,?,?,?,NULL)",
+                      (f"{doc_id}:{page}:0", T1, doc_id, page, text))
+    ids = [f"{doc_id}:{p}:0" for p in (1, 2, 10, 11, 12)]
+    assert min(ids) == f"{doc_id}:10:0", f"lexicographic trap missing: {min(ids)}"
+
+    picked = agent._identity_chunks(T1, [doc_id])
+    assert [h["id"] for h in picked] == [f"{doc_id}:1:0"], picked
+    assert picked[0]["meta"]["page"] == 1, picked
+
+    # a document with no chunks is skipped (never crashes, never appended)
+    empty = D.uid()
+    with D.db() as c:
+        c.execute("INSERT INTO documents(id,tenant_id,filename,visibility,department,uploaded_by,chunks)"
+                  " VALUES(?,?,?,?,?,?,?)",
+                  (empty, T1, "Empty.txt", "restricted", "", "test", 0))
+    assert agent._identity_chunks(T1, [doc_id, empty, doc_id]) == picked, \
+        "chunkless docs skipped, doc_ids deduplicated"
+
+    # retrieve() integration: the query ranks only the section pages (pages
+    # 2/10/11/12 share its tokens, the cover does not) — the cover must be
+    # ADDED by the append, proven by the "+1 identity" trace marker
+    out = agent.retrieve({"question": "section marker unique text", "tenant_id": T1,
+                          "doc_ids": [doc_id, empty],
+                          "queries": ["section marker unique text"], "retries": 0})
+    assert any(h["id"] == f"{doc_id}:1:0" for h in out["hits"]), \
+        "retrieve() must append the numeric-first cover chunk"
+    assert not any(h["meta"]["doc_id"] == empty for h in out["hits"])
+    assert "retrieve:" in out["trace"][-1] and "(+1 identity)" in out["trace"][-1], out["trace"]
+
+
+@test
+def test_identity_chunks_respect_tenant_and_department_scope():
+    """Identity chunks may only ever come from s['doc_ids']: another tenant's
+    cover page and another department's cover page must never enter evidence
+    nor any model prompt, while each scope still gets its own cover."""
+    t2_sentinel = "T2-CROSS-TENANT-SENTINEL-77"
+    t2_doc = _doc("Human Resources", "OtherOrgCover.txt",
+                  f"Partner Cover: arrangements for the partner conference are handled "
+                  f"by the partner helpdesk. Reference {t2_sentinel}.", tenant=T2)
+
+    # T1 HR member: the Engineering doc (other department) and the T2 doc
+    # (other tenant) are out of scope — sentinels must never reach evidence
+    # or ANY prompt, but their own covers must be appended
+    _reset_llm(answer="Full-time employees accrue 20 paid vacation days per year.")
+    res = _run_as("hr_member", VAC_Q)
+    assert res["abstained"] is False, res
+    ev_ids = [e["chunk_id"] for e in res["evidence"]]
+    assert VAC in [e["doc_id"] for e in res["evidence"]], res["evidence"]
+    assert DEPLOY not in [e["doc_id"] for e in res["evidence"]], \
+        "department-scope violation via identity append"
+    assert t2_doc not in [e["doc_id"] for e in res["evidence"]], \
+        "cross-tenant violation via identity append"
+    assert f"{DEPLOY}:1:0" not in ev_ids and f"{t2_doc}:1:0" not in ev_ids, ev_ids
+    for c in CALLS:
+        for sentinel in (ENG_SENTINEL, t2_sentinel):
+            assert sentinel not in c["prompt"] and sentinel not in c["system"], \
+                "unauthorized cover chunk leaked into a model prompt"
+
+    # positive control: the T2 member gets their own cover in context and
+    # never any T1 document
+    _reset_llm(answer="The partner helpdesk handles partner conference arrangements.")
+    res2 = _run_as("other_member", "Where are the partner conference arrangements handled?")
+    assert res2["abstained"] is False, res2
+    assert t2_doc in [e["doc_id"] for e in res2["evidence"]], res2["evidence"]
+    assert VAC not in [e["doc_id"] for e in res2["evidence"]], "cross-tenant leakage"
+    gen = [c for c in CALLS if _is_answer_call(c["system"])]
+    assert gen and all("partner conference" in c["prompt"] for c in gen), \
+        "own cover chunk must reach the generation context"
+    assert all(ENG_SENTINEL not in c["prompt"] for c in CALLS), "cross-department leakage"
+
+
+@test
+def test_identity_append_is_capped_deduped_and_ranked_first():
+    """Safety cap (config.MAX_IDENTITY_CHUNKS): at most `cap` cover chunks are
+    appended, AFTER the ranked hits which are never capped or displaced;
+    duplicate doc_ids cannot duplicate chunks; and a same-tenant document that
+    is NOT in doc_ids never enters the evidence."""
+    cap = MAX_IDENTITY_CHUNKS
+    assert cap >= 1, "tests assume a positive identity cap (default 3)"
+
+    # ranked source matches the query; the covers deliberately do not
+    ranked_doc = _doc("Human Resources", "CapRanked.txt",
+                      "Frobnicator calibration results for the quux device.")
+    covers = [_doc("Human Resources", f"CapCover{i}.txt",
+                   f"Cover page identity fact number {i}.") for i in range(cap + 2)]
+    # same tenant + department, but deliberately NOT passed in doc_ids below
+    out_of_scope = _doc("Human Resources", "CapOutOfScope.txt",
+                        "Cover page identity fact number 99.")
+    ranked_id, cover_ids = f"{ranked_doc}:1:0", [f"{d}:1:0" for d in covers]
+
+    # duplicate entries in doc_ids + ranked doc present, out-of-scope absent
+    doc_ids = covers + [ranked_doc] + covers + [covers[0]]
+    out = agent.retrieve({"question": "frobnicator calibration quux", "tenant_id": T1,
+                          "doc_ids": doc_ids, "queries": ["frobnicator calibration quux"],
+                          "retries": 0})
+
+    hits = out["hits"]
+    assert hits[0]["id"] == ranked_id, "ranked results must stay first"
+    assert hits[1:] and [h["id"] for h in hits[1:]] == cover_ids[:cap], \
+        f"exactly the first {cap} covers in caller order, got {[h['id'] for h in hits[1:]]}"
+    assert len(hits) == 1 + cap, f"cap must bound the append: {len(hits)}"
+    ids = [h["id"] for h in hits]
+    assert len(set(ids)) == len(ids), f"duplicate chunks in evidence: {ids}"
+    assert f"{out_of_scope}:1:0" not in ids, "document outside doc_ids must never be appended"
+    assert out["trace"][-1] == f"retrieve: {1 + cap} passages kept (+{cap} identity)", out["trace"]
+    # covers the cap dropped are still simply absent (nothing displaced)
+    assert not (set(cover_ids[cap:]) & set(ids))
 
 
 def main():

@@ -113,7 +113,17 @@ def me(u=Depends(S.current_user)):
 
 @app.get("/api/providers")
 def providers(u=Depends(S.current_user)):
-    return {"llm": llm.available(), "embeddings": E.available()}
+    # vectors_stored: do ANY chunks actually have vectors? embeddings=true only
+    # means a key is configured — it says nothing about indexed vectors (docs
+    # uploaded before the key was set are BM25-only until backfilled via
+    # rag.backfill_embeddings). Authenticated-only: avoids an unauthenticated
+    # scan and never exposes counts, just a boolean per caller's own tenant.
+    with D.db() as c:
+        has_vectors = c.execute(
+            "SELECT 1 FROM chunks WHERE tenant_id=? AND embedding IS NOT NULL LIMIT 1",
+            (u["tenant_id"],)).fetchone() is not None
+    return {"llm": llm.available(), "embeddings": E.available(),
+            "vectors_stored": has_vectors}
 
 
 # ── Documents (admin writes; reads are scope- and ACL-filtered via authz) ───
@@ -693,6 +703,30 @@ def stats(u=Depends(S.admin_user)):
             # stored bytes (real, tenant-scoped): SUM of indexed file content
             "storage": q("SELECT COALESCE(SUM(LENGTH(content)),0) FROM documents WHERE tenant_id=?"),
         }
+
+
+@app.post("/api/admin/backfill-embeddings")
+def backfill(u=Depends(S.admin_user)):
+    """Vectorize this tenant's chunks that were ingested WITHOUT embeddings.
+
+    Documents uploaded while no embedding key was configured are BM25-only
+    forever — setting the key later does not create their vectors. Admin-only
+    and hard-scoped to the caller's own tenant. Bounded per call (default 200
+    chunks) so it stays inside the serverless function timeout; call again
+    until `pending` is 0. Idempotent: only NULL-embedding chunks are touched.
+    """
+    if not E.available():
+        raise HTTPException(409, "No embedding provider configured "
+                                 "(set OPENAI_API_KEY or GEMINI_API_KEY first).")
+    stats = rag.backfill_embeddings(tid=u["tenant_id"], batch=64, limit=200)
+    D.audit(u["tenant_id"], u["id"], "embeddings_backfilled",
+            f"{stats['embedded']}/{stats['pending']} via {stats['provider'] or 'none'}")
+    with D.db() as c:  # true remaining count for this tenant (not just this batch)
+        remaining = c.execute(
+            "SELECT COUNT(*) FROM chunks WHERE tenant_id=? AND embedding IS NULL",
+            (u["tenant_id"],)).fetchone()[0]
+    return {"provider": stats["provider"], "embedded": stats["embedded"],
+            "pending_backfill": remaining, "done": remaining == 0}
 
 
 @app.get("/api/health")

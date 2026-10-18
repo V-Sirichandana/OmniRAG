@@ -37,6 +37,11 @@ MIN_RERANK = float(os.getenv("MIN_RERANK_SCORE", "0.05"))
 # attempted. Deterministic and LLM-free — see app/rag.py::sufficiency.
 MIN_EVIDENCE_COVERAGE = float(os.getenv("MIN_EVIDENCE_COVERAGE", "0.30"))
 
+# Identity-chunk safety cap (agent): maximum cover/first chunks APPENDED after
+# the ranked evidence per retrieval. Ranked results are never capped and are
+# always kept first; 0 disables the identity append entirely.
+MAX_IDENTITY_CHUNKS = max(0, int(os.getenv("MAX_IDENTITY_CHUNKS", "3")))
+
 # Vercel Functions accept at most ~4.5 MB per request body.
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "4"))
 ALLOWED_EXT = {".pdf", ".docx", ".pptx", ".txt", ".md", ".csv", ".json"}

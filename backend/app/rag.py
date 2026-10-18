@@ -60,12 +60,34 @@ def extract(filename: str, data: bytes) -> list[tuple[int, str]]:
         from pypdf import PdfReader
         return [(i + 1, p.extract_text() or "") for i, p in enumerate(PdfReader(io.BytesIO(data)).pages)]
     if ext == ".docx":
+        # Paragraphs AND table cells, in document order: table-hosted facts
+        # (policy limits, contact lists, SLAs) were previously invisible.
         import docx
-        return [(1, "\n".join(p.text for p in docx.Document(io.BytesIO(data)).paragraphs))]
+        from docx.table import Table
+        from docx.text.paragraph import Paragraph
+        d = docx.Document(io.BytesIO(data))
+        parts: list[str] = []
+        for child in d.element.body.iterchildren():
+            if child.tag.endswith("}p"):
+                parts.append(Paragraph(child, d).text)
+            elif child.tag.endswith("}tbl"):
+                for row in Table(child, d).rows:
+                    parts.append(" | ".join(c.text for c in row.cells))
+        return [(1, "\n".join(x for x in parts if x.strip()))]
     if ext == ".pptx":
+        # Slide text AND table shapes (sh.has_table), per slide.
         from pptx import Presentation
-        return [(i + 1, "\n".join(sh.text_frame.text for sh in s.shapes if sh.has_text_frame))
-                for i, s in enumerate(Presentation(io.BytesIO(data)).slides)]
+        out = []
+        for i, s in enumerate(Presentation(io.BytesIO(data)).slides):
+            parts = []
+            for sh in s.shapes:
+                if sh.has_text_frame:
+                    parts.append(sh.text_frame.text)
+                if getattr(sh, "has_table", False):
+                    for row in sh.table.rows:
+                        parts.append(" | ".join(c.text_frame.text for c in row.cells))
+            out.append((i + 1, "\n".join(x for x in parts if x.strip())))
+        return out
     text = data.decode("utf-8", errors="ignore")
     if ext == ".csv":
         text = "\n".join(", ".join(r) for r in csv.reader(io.StringIO(text)))
@@ -98,10 +120,13 @@ def ingest(tid, doc_id, filename, data) -> int:
     if not rows:
         return 0
     vectors = E.embed([r[4] for r in rows])          # None → BM25-only mode
+    if vectors is not None and len(vectors) != len(rows):
+        vectors = None                               # never store a partial/misaligned batch
+    emb = vectors if vectors is not None else [None] * len(rows)
     with D.db() as c:
         c.executemany(
             "INSERT INTO chunks(id,tenant_id,doc_id,page,text,embedding) VALUES(?,?,?,?,?,?)",
-            [r + (json.dumps(v) if vectors is not None else None,) for r in rows],
+            [r + (None if v is None else json.dumps(v),) for r, v in zip(rows, emb)],
         )
     return len(rows)
 
@@ -109,6 +134,49 @@ def ingest(tid, doc_id, filename, data) -> int:
 def delete_doc(tid, doc_id):
     with D.db() as c:
         c.execute("DELETE FROM chunks WHERE tenant_id=? AND doc_id=?", (tid, doc_id))
+
+
+def backfill_embeddings(tid=None, doc_ids=None, batch=32, limit=0):
+    """Embed any stored chunks that are missing vectors (idempotent).
+
+    Documents ingested while no embedding key was configured have
+    ``embedding = NULL`` and stay BM25-only forever — adding a key later does
+    NOT retroactively vectorize them. This walks the chunks table (optionally
+    scoped to a tenant/document set), embeds the missing texts with the
+    CURRENT provider/model, and writes the vectors back. ``limit`` caps how
+    many chunks are processed in this call (0 = all) so callers can page
+    through large backlogs inside serverless timeouts. Returns a stats dict;
+    never raises on provider errors (reports ``embedded: 0`` and stops).
+
+    Scope note: this is a data-admin operation. Callers must only pass
+    tenants/doc_ids they administer; it performs no authorization of its own.
+    """
+    where, params = ["embedding IS NULL"], []
+    if tid is not None:
+        where.append("tenant_id=?"); params.append(tid)
+    if doc_ids is not None:
+        if not doc_ids:
+            return {"pending": 0, "embedded": 0, "provider": E.provider()}
+        where.append(f"doc_id IN ({','.join('?' * len(doc_ids))})"); params += list(doc_ids)
+    sql = f"SELECT id, tenant_id, text FROM chunks WHERE {' AND '.join(where)} ORDER BY id"
+    if limit:
+        sql += f" LIMIT {int(limit)}"
+    with D.db() as c:
+        rows = c.execute(sql, params).fetchall()
+    pending = len(rows)
+    if not pending:
+        return {"pending": 0, "embedded": 0, "provider": E.provider()}
+    done = 0
+    for i in range(0, pending, batch):
+        part = rows[i:i + batch]
+        vecs = E.embed([r["text"] for r in part])
+        if vecs is None or len(vecs) != len(part):
+            break                                    # provider gone/failed: stop, keep the rest pending
+        with D.db() as c:
+            c.executemany("UPDATE chunks SET embedding=? WHERE id=?",
+                          [(json.dumps(v), r["id"]) for r, v in zip(part, vecs)])
+        done += len(part)
+    return {"pending": pending, "embedded": done, "provider": E.provider()}
 
 
 def drop_tenant(tid):
@@ -154,13 +222,21 @@ def search(tid, doc_ids, query, k=8):
             except Exception:
                 pass
 
-    # --- dense leg (skipped when no embedding provider is configured) -------
+    # --- dense leg (only when BOTH a provider is configured AND stored vectors
+    # exist in scope — embedding the query when no stored vector can consume it
+    # is a wasted API call + latency on every search) --------------------------
     dense: list[str] = []
-    qv = E.embed([query])
-    if qv:
-        scored = [(i, _cosine(qv[0], v)) for i, v in vectors.items() if v]
-        scored.sort(key=lambda t: -t[1])
-        dense = [i for i, s in scored[: k * 2] if s > 0]
+    if vectors:
+        qv = E.embed([query])
+        if qv:
+            qdim = len(qv[0])
+            # Dimension guard: vectors from a different model/provider than the
+            # query (mixed corpora after a provider switch) must be skipped —
+            # zip() would silently truncate them into garbage similarities.
+            scored = [(i, _cosine(qv[0], v)) for i, v in vectors.items()
+                      if v and len(v) == qdim]
+            scored.sort(key=lambda t: -t[1])
+            dense = [i for i, s in scored[: k * 2] if s > 0]
 
     # --- sparse leg (always available) -------------------------------------
     # BM25's idf can be zero or negative on very small corpora (1-2 docs), so
