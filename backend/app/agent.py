@@ -41,6 +41,32 @@ SYS = ("You are an enterprise knowledge assistant. Answer ONLY from the numbered
 # citation/reference markers some models emit anyway (e.g. [1] or 【5†p.3】)
 _CITE = re.compile(r"(?:\s*【\d+†[^】]*】)+|(?:\s*\[\d+\])+")
 
+# ── Conversational intent gate ──────────────────────────────────────────────
+# Deterministic and deliberately NARROW: only an exact match of the normalized
+# message counts as casual chat, so a real document question ("Thank you, what
+# is the leave policy?") can never be swallowed by it. No LLM, no retrieval and
+# no verification run for these — they return a fixed reply immediately.
+_GREETING = "Hello! How can I help you with your organization's documents today?"
+_ACK = "Understood — let me know what you'd like to find in your documents."
+_THANKS = "You're welcome! Let me know if you have any other questions."
+
+_CASUAL = {
+    "hi": _GREETING, "hello": _GREETING, "hey": _GREETING,
+    "ok": _ACK, "okay": _ACK, "got it": _ACK,
+    "thanks": _THANKS, "thank you": _THANKS, "tq": _THANKS,
+}
+
+
+def casual_reply(question) -> str | None:
+    """Fixed reply for obvious conversational messages, else None.
+
+    Normalization is whitespace collapse + case fold + trailing-punctuation
+    strip only. Anything longer than the listed phrases — including a
+    thanks-prefixed document question — returns None and flows to the graph.
+    """
+    q = re.sub(r"\s+", " ", str(question or "")).strip().lower().rstrip("!?.;:").strip()
+    return _CASUAL.get(q)
+
 
 def clean_markers(text: str) -> str:
     """Strip any citation/reference markers from an answer before it is shown."""
@@ -274,6 +300,15 @@ def _result(out: dict) -> dict:
     }
 
 def run(question, tenant_id, doc_ids, history, provider=None) -> dict:
+    reply = casual_reply(question)
+    if reply is not None:
+        # Conversational only: the graph is never invoked, so retrieval, the
+        # sufficiency gate, generation and verification are all skipped and no
+        # document text can reach a model. Authorization is untouched — this
+        # path reads no documents at all.
+        return {"answer": reply, "grounded": True, "confidence": 0, "abstained": False,
+                "abstain_reason": "", "retries": 0, "sufficiency": {}, "providers": "",
+                "evidence": [], "trace": ["casual: conversational reply (no retrieval)"]}
     out = GRAPH.invoke({"question": question, "tenant_id": tenant_id, "doc_ids": doc_ids,
                         "history": history, "provider": provider, "retries": 0})
     # No sources, no model name in the result — retrieval details stay server-side.

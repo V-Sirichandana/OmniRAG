@@ -644,6 +644,75 @@ def test_identity_append_is_capped_deduped_and_ranked_first():
     assert not (set(cover_ids[cap:]) & set(ids))
 
 
+# ---------------------------------------------------------------------------
+# Conversational intent gate
+# ---------------------------------------------------------------------------
+CASUAL_GREETING = "Hello! How can I help you with your organization's documents today?"
+CASUAL_ACK = "Understood — let me know what you'd like to find in your documents."
+CASUAL_THANKS = "You're welcome! Let me know if you have any other questions."
+
+
+@test
+def test_casual_gate_normalizes_but_matches_only_exact_phrases():
+    from app import agent as A
+    for q in ("hi", "Hello", "  HEY  ", "hey!", "Hi.", "OK", "okay", "got it",
+              "Thanks", "thank   you", "TQ!", "  thanks.  "):
+        assert A.casual_reply(q) is not None, f"expected casual match for {q!r}"
+    assert A.casual_reply("hi") == CASUAL_GREETING
+    assert A.casual_reply("ok") == CASUAL_ACK
+    assert A.casual_reply("thank you") == CASUAL_THANKS
+    # Real document questions — including thanks/hi-prefixed ones — never match.
+    for q in ("Thank you, what is the leave policy?",
+              "What is the parental leave policy?",
+              "Does the company offer paternity leave?",
+              "hi, how many paid vacation days do we get?",
+              "okay so what does the deployment policy require?",
+              "thanks — how many approvals do deployments need?",
+              VAC_Q, DEPLOY_Q, "hi there", "tqvm", ""):
+        assert A.casual_reply(q) is None, f"must not treat as casual: {q!r}"
+
+
+@test
+def test_casual_gate_skips_retrieval_and_the_model():
+    from app import agent as A
+    _reset_llm()
+    calls_before = len(CALLS)
+    orig_search, boom = A.rag.search, []
+
+    def _no_search(*a, **k):
+        boom.append(1)
+        raise AssertionError("retrieval must not run for casual chat")
+
+    A.rag.search = _no_search
+    try:
+        r = _run_as("hr_member", "  Thank YOU!  ")
+    finally:
+        A.rag.search = orig_search
+    assert r["answer"] == CASUAL_THANKS, r["answer"]
+    assert r["abstained"] is False
+    assert r["evidence"] == [] and r["providers"] == ""
+    assert not boom, "rag.search was called for a casual message"
+    assert len(CALLS) == calls_before, "an LLM call was issued for a casual message"
+    # greetings, acknowledgements and thanks behave identically
+    assert _run_as("hr_member", "hi")["answer"] == CASUAL_GREETING
+    assert _run_as("fin_member", "got it")["answer"] == CASUAL_ACK
+    assert _run_as("fin_member", "tq")["answer"] == CASUAL_THANKS
+
+
+@test
+def test_casual_gate_leaves_document_questions_and_abstentions_intact():
+    _reset_llm(answer="20 paid vacation days.")
+    r = _run_as("hr_member", "Thanks, how many vacation days do employees accrue?")
+    assert CALLS, "a thanks-prefixed document question must reach the model"
+    assert r["evidence"], "…and must retrieve authorized evidence"
+    assert r["abstained"] is False and "20 paid" in r["answer"]
+    # the backend abstention decision is unchanged for a real, unsupported question
+    _reset_llm()
+    r2 = _run_as("hr_member", "Does the company offer paternity leave?")
+    assert r2["abstained"] is True, r2
+    assert "couldn't find this" in r2["answer"].lower()
+
+
 def main():
     print("Agent pipeline tests (offline, stubbed LLM)")
     passed = failed = 0

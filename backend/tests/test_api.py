@@ -1379,6 +1379,37 @@ def test_at_username_rejected_even_with_prechecks_blinded():
     assert legacy.status_code == 200, legacy.text
 
 
+# --- Conversational intent gate (observed through the API) -------------------
+
+@test
+def test_casual_chat_needs_no_llm_and_persists_normally():
+    t = auth(STATE["acme"]["token"])
+    before = len(client.get("/api/conversations", headers=t).json())
+    # No LLM key is configured for these tests, yet casual turns return 200:
+    # they short-circuit before retrieval, generation and verification.
+    for q, marker in (("hi", "Hello!"), ("OK", "Understood"),
+                      ("  thank you!  ", "You're welcome")):
+        r = client.post("/api/chat", headers=t, json={"question": q})
+        assert r.status_code == 200, (q, r.status_code, r.text)
+        assert marker in r.json()["answer"], (q, r.json()["answer"])
+        assert r.json()["conversation_id"], "casual turns must still be persisted"
+    convs = client.get("/api/conversations", headers=t).json()
+    assert len(convs) == before + 3, (before, len(convs))
+    titles = {c["title"] for c in convs}
+    assert {"hi", "OK", "  thank you!  "} <= titles, titles
+
+
+@test
+def test_thanks_prefixed_document_question_still_goes_through_rag():
+    t = auth(STATE["acme"]["token"])
+    r = client.post("/api/chat", headers=t,
+                    json={"question": "Thank you, how many weeks of parental leave?"})
+    # Same document question the 503 test uses: with no LLM key the real RAG
+    # path fails with 503, proving the casual gate did not swallow it.
+    assert r.status_code == 503, (r.status_code, r.text)
+    assert "key" in r.json()["detail"].lower()
+
+
 def main():
     failed = 0
     for fn in TESTS:

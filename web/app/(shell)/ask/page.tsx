@@ -4,9 +4,11 @@
  * Ask OmniRAG — chat over the documents you are authorized to access.
  *
  * Streams nothing (single request); answers are plain text and the UI states
- * plainly when nothing was found — abstentions from the verification pipeline
- * are highlighted, never hidden. Supports deep-links: /ask?c=<id> loads a
- * conversation, /ask?q=<text> pre-fills and sends a question.
+ * plainly when nothing was found — an abstention is always shown, never
+ * hidden, but only as a short user-friendly notice (the pipeline's internal
+ * wording stays server-side). Obvious casual messages ("hi", "thanks") get a
+ * fixed reply from the backend without retrieval. Supports deep-links:
+ * /ask?c=<id> loads a conversation, /ask?q=<text> pre-fills and sends a question.
  */
 import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
@@ -14,10 +16,10 @@ import {
   AlertTriangle,
   BookOpenCheck,
   CornerDownLeft,
-  ShieldQuestion,
   Sparkles,
 } from "lucide-react";
 import { api, ApiError, errorToMessage } from "@/lib/api";
+import { presentAssistantText } from "@/lib/answer-text";
 import { useAuth } from "@/lib/auth";
 import type { ChatResponse, Message, Providers } from "@/lib/types";
 import { ErrorNote } from "@/components/ui";
@@ -32,12 +34,6 @@ const SUGGESTIONS = [
   "Summarize the deployment security standard.",
   "How many casual leave days do employees get?",
 ];
-
-/** Known abstention phrasings returned by the backend verification pipeline. */
-function isAbstention(text: string): boolean {
-  const t = text.toLowerCase();
-  return t.includes("couldn't find this") || t.includes("don't contain enough support");
-}
 
 function AskPage() {
   const { user } = useAuth();
@@ -229,19 +225,8 @@ function AskPage() {
                   </div>
                   <div className="rounded-2xl rounded-bl-md border border-line bg-white px-4 py-3.5 shadow-[0_1px_2px_rgba(15,23,42,.05)]">
                     <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800">
-                      {m.content}
+                      {presentAssistantText(m.content)}
                     </p>
-                    {isAbstention(m.content) && (
-                      <div className="mt-3 flex items-start gap-2 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] leading-relaxed text-amber-700">
-                        <ShieldQuestion size={13} className="mt-0.5 shrink-0" />
-                        <span>
-                          <strong>Verification:</strong> the retrieval pipeline found
-                          insufficient supporting evidence in your accessible documents, so
-                          no answer was generated — this is an intentional abstention, not
-                          an error.
-                        </span>
-                      </div>
-                    )}
                   </div>
                 </div>
               </div>
