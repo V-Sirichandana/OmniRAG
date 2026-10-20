@@ -58,6 +58,7 @@ export default function AdminPage() {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
   const [issued, setIssued] = useState<string>("");
+  const [emailNonce, setEmailNonce] = useState(0); // remount email cells after a rejected edit
 
   // invite form
   const [dept, setDept] = useState("");
@@ -117,6 +118,20 @@ export default function AdminPage() {
       load();
     } catch (e) {
       setError(e instanceof ApiError ? e.message : "Delete failed");
+    }
+  }
+
+  async function saveEmail(u: AdminUser, value: string) {
+    const next = value.trim().toLowerCase();
+    const prev = (u.email ?? "").trim().toLowerCase();
+    if (next === prev) return; // no PATCH for a no-op blur
+    try {
+      await api.patch(`/api/admin/users/${u.id}`, { email: next || null });
+      load();
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Email update failed");
+      setEmailNonce((n) => n + 1); // reset the input back to the stored value
+      load();
     }
   }
 
@@ -183,10 +198,11 @@ export default function AdminPage() {
         bodyClassName="p-0"
       >
         <div className="overflow-x-auto">
-          <table className="w-full min-w-[820px] text-left text-sm">
+          <table className="w-full min-w-[1080px] text-left text-sm">
             <thead>
               <tr className="border-b border-line bg-panel-2 text-[11px] uppercase tracking-wide text-slate-500">
                 <th className="px-5 py-3 font-medium">Employee</th>
+                <th className="px-3 py-3 font-medium">Work email</th>
                 <th className="px-3 py-3 font-medium">Employee ID</th>
                 <th className="px-3 py-3 font-medium">Department</th>
                 <th className="px-3 py-3 font-medium">Role</th>
@@ -210,6 +226,21 @@ export default function AdminPage() {
                         )}
                       </span>
                     </div>
+                  </td>
+                  <td className="px-3 py-3">
+                    <input
+                      key={`${u.id}:${u.email ?? ""}:${emailNonce}`}
+                      defaultValue={u.email ?? ""}
+                      placeholder="Set work email"
+                      aria-label={`Work email for ${u.username}`}
+                      onBlur={(e) => void saveEmail(u, e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") e.currentTarget.blur();
+                      }}
+                      className="w-[210px] rounded-md border border-line-2 bg-white px-2 py-1.5 text-xs text-slate-700 outline-none focus:border-brand-2"
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
                   </td>
                   <td className="px-3 py-3">
                     <span className="rounded-md bg-indigo-50 px-2 py-1 font-mono text-[11px] text-indigo-700">

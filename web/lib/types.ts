@@ -11,6 +11,8 @@ export type Visibility =
 export interface User {
   id: string;
   username: string;
+  /** Work email (optional) — null/absent for username-only accounts. */
+  email?: string | null;
   role: Role;
   tenant_id: string;
   department: string;
@@ -73,6 +75,8 @@ export interface Message {
 export interface AdminUser {
   id: string;
   username: string;
+  /** Work email (optional) — null/absent for username-only accounts. */
+  email?: string | null;
   role: Role;
   department: string;
   employee_id?: string | null;

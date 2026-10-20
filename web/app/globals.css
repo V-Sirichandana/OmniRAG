@@ -92,4 +92,13 @@
   .text-muted {
     color: #64748b;
   }
+  /* navy backdrop with subtle teal glows — the brand panel of the PUBLIC
+     auth routes only (/login, /signup, /join). The dashboard keeps its
+     existing indigo identity; nothing outside auth references this class. */
+  .auth-glow {
+    background:
+      radial-gradient(900px 500px at 12% -10%, rgba(45, 212, 191, 0.16), transparent 60%),
+      radial-gradient(820px 560px at 92% 112%, rgba(20, 184, 166, 0.14), transparent 58%),
+      var(--color-navy);
+  }
 }

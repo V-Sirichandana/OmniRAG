@@ -191,7 +191,20 @@ python tests/test_api.py        # 37/37: auth, tenant isolation, ACL, retrieval,
 ## Security model
 
 - Passwords hashed with bcrypt; JWT (HS256) bearer tokens; account lockout
-  after repeated failed logins.
+  after repeated failed logins. Login accepts a username **or** the account's
+  work email in the same `username` field; emails are optional, stored
+  normalized and globally unique (like usernames), so existing accounts keep
+  working unchanged. Uniqueness is enforced case-insensitively by the
+  database itself (SQLite `COLLATE NOCASE` / PostgreSQL `lower(email)`), an
+  email may never equal another account's username (no identifier shadowing),
+  and uniqueness races answer 409 instead of 500. New usernames may not
+  contain `@` (HTTP 400 at organization signup and invitation registration,
+  rejected before any write) — since every work email must — so the two
+  identifier kinds can never be equal and the cross-column race is closed by
+  construction; existing `@`-usernames are preserved untouched and keep
+  logging in exactly as before. This username rule is application-level only:
+  raw SQL can bypass it and insert an `@`-username (no database trigger was
+  added), so manual writes must respect the same convention.
 - **Every** list/get/delete/search/conversation endpoint filters by the
   caller's `tenant_id` from the (verified) token — cross-tenant access returns
   404 or empty, never data.
@@ -212,12 +225,12 @@ python tests/test_api.py        # 37/37: auth, tenant isolation, ACL, retrieval,
 
 | Area | Endpoints |
 |------|-----------|
-| Auth | `POST /api/auth/signup-org`, `POST /api/auth/login`, `POST /api/auth/register` (employee ID), `GET /api/auth/me` |
+| Auth | `POST /api/auth/signup-org` (optional `email`), `POST /api/auth/login` (username **or** work email in `username`), `POST /api/auth/register` (employee ID), `GET /api/auth/me` |
 | Departments | `GET/POST /api/departments`, `DELETE /api/departments/{id}` |
 | Documents | `GET/POST /api/documents` (multipart; scopes + `department_ids` + `download_allowed`), `GET /api/documents/{id}/download` (permission-checked), `PATCH /api/documents/{id}/access` (scope, allowlist, download), `DELETE /api/documents/{id}` |
 | Chat | `POST /api/chat`, `GET /api/conversations`, `GET /api/conversations/{id}` |
 | Search | `POST /api/search` (retrieval with citations, no LLM) |
-| Admin | `GET /api/admin/stats` (incl. `storage` bytes), `GET /api/admin/users`, `PATCH/DELETE /api/admin/users/{id}` (role, department, `is_manager`), `POST/GET /api/admin/invites`, `GET /api/admin/audit` |
+| Admin | `GET /api/admin/stats` (incl. `storage` bytes), `GET /api/admin/users`, `PATCH/DELETE /api/admin/users/{id}` (role, department, `is_manager`, work `email`), `POST/GET /api/admin/invites`, `GET /api/admin/audit` |
 | Team | `GET /api/team/overview` (department docs/members for designated managers only — 403 otherwise) |
 | Meta | `GET /api/health`, `GET /api/providers`, `GET /api/docs` |
 

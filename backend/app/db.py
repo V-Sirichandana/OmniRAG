@@ -58,6 +58,12 @@ else:
         return c
 
 
+# Driver integrity-error class so callers can map UNIQUE-constraint races to a
+# controlled 409 instead of a 500 (psycopg's UniqueViolation subclasses
+# psycopg.errors.IntegrityError; SQLite raises sqlite3.IntegrityError).
+IntegrityError = psycopg.errors.IntegrityError if PG else sqlite3.IntegrityError
+
+
 class _Cursor:
     """Tiny wrapper so the rest of the code can use `?` placeholders everywhere.
 
@@ -121,7 +127,7 @@ SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS tenants(
   id TEXT PRIMARY KEY, name TEXT NOT NULL, created TEXT DEFAULT CURRENT_TIMESTAMP);
 CREATE TABLE IF NOT EXISTS users(
-  id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
+  id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, email TEXT, pw_hash TEXT NOT NULL,
   tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
   role TEXT NOT NULL DEFAULT 'member',
   department TEXT NOT NULL DEFAULT 'General',
@@ -187,6 +193,9 @@ _MIGRATIONS = [
     # Manager designation: a UI/workspace gate only — grants no extra data,
     # document or user-management privileges (default 0 for existing users).
     ("users", "is_manager", "INTEGER NOT NULL DEFAULT 0"),
+    # Work-email identity (Stage A): nullable, so legacy accounts keep their
+    # username-only login; uniqueness comes from the partial index in init().
+    ("users", "email", "TEXT"),
 ]
 
 
@@ -209,6 +218,35 @@ def init():
         for table, column, decl in _MIGRATIONS:
             if not _has_column(c, table, column):
                 c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        # Stage A: global work-email uniqueness. The partial index tolerates any
+        # number of NULL emails (every pre-existing account) and is valid on both
+        # SQLite (>= 3.8) and PostgreSQL; created AFTER the column migration so
+        # old databases work too, and IF NOT EXISTS keeps init() idempotent.
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email "
+                  "ON users(email) WHERE email IS NOT NULL")
+        # Hardening (R2): database-level CASE-INSENSITIVE email uniqueness, a
+        # backstop to app-layer normalization in main._norm_email (which folds
+        # case on every write; only raw SQL/manual edits can bypass it). Still
+        # partial, so unlimited NULL emails remain allowed. Dialect semantics:
+        #   SQLite  -> email COLLATE NOCASE (ASCII folding; matches lower())
+        #   Postgres-> lower(email)        (locale-aware folding)
+        # The exact-match index above is kept (harmless; superset is enforced
+        # by this one). Before creating the index, look for case-variant
+        # duplicates that would make creation fail midway: stop loudly with an
+        # actionable error and change NOTHING — never delete or rewrite users.
+        dupes = [r["e"] for r in c.execute(
+            "SELECT lower(email) AS e FROM users WHERE email IS NOT NULL "
+            "GROUP BY lower(email) HAVING COUNT(*) > 1")]
+        if dupes:
+            raise RuntimeError(
+                "Cannot create the case-insensitive email unique index: existing "
+                "case-variant duplicate emails " + str(sorted(dupes)) + ". Merge "
+                "or clear those accounts manually, then restart. No data was changed.")
+        c.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_ci "
+            "ON users (lower(email)) WHERE email IS NOT NULL" if PG else
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_ci "
+            "ON users(email COLLATE NOCASE) WHERE email IS NOT NULL")
         # Existing tenants (from older local databases) get default departments too.
         for r in c.execute("SELECT id FROM tenants").fetchall():
             seed_departments(c, r["id"])

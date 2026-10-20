@@ -36,6 +36,8 @@ app.add_middleware(CORSMiddleware, allow_origins=CORS, allow_methods=["*"], allo
 
 # ── Auth ────────────────────────────────────────────────────────────────────
 class Login(BaseModel):
+    # `username` is the login identifier: an existing account name, or (Stage A)
+    # the account's work email — same field name, so old clients stay valid.
     username: str
     password: str
 
@@ -48,13 +50,75 @@ class OrgSignup(BaseModel):
     org_name: str = Field(min_length=2, max_length=80)
     username: str = Field(min_length=3, max_length=40)
     password: str = Field(min_length=8, max_length=100)
+    # Optional work email for the creating admin; never required (old clients).
+    email: str | None = None
+
+
+def _norm_email(v) -> str | None:
+    """Normalize a work email for storage: trim + lowercase, or None if empty.
+
+    Stage A identity only — no delivery, no verification. Emails are stored
+    normalized so the partial UNIQUE index in db.py is a plain column
+    comparison on both SQLite and PostgreSQL; malformed values are rejected
+    with 400 before anything is written.
+    """
+    if v is None:
+        return None
+    e = str(v).strip().lower()
+    if not e:
+        return None
+    if len(e) > 254 or e.count("@") != 1 or any(ch.isspace() for ch in e):
+        raise HTTPException(400, "Invalid email address")
+    local, domain = e.split("@")
+    if not local or not domain:
+        raise HTTPException(400, "Invalid email address")
+    return e
+
+
+def _norm_username(v) -> str:
+    """Normalize a NEW username on both username-write paths (signup, register).
+
+    Keeps the pre-existing rules — trim, lowercase, 3-40 characters — and adds
+    the cross-column race fix: usernames may not contain '@'. Every work email
+    must contain exactly one '@' (see _norm_email), so the two identifier kinds
+    can never be equal: no check against other rows is needed, hence nothing to
+    race against on either database. Existing accounts with '@'-usernames are
+    untouched — this never runs on login/session/read paths, and no
+    username-update path exists. Limitation: application-level only — raw SQL
+    can still insert an '@'-username (no DB trigger in this pass).
+    """
+    name = str(v).strip().lower()
+    if "@" in name:
+        raise HTTPException(400, "Username must not contain '@'")
+    if not 3 <= len(name) <= 40:
+        raise HTTPException(400, "Username must be 3-40 characters")
+    return name
+
+
+def _assert_email_available(c, email: str | None, user_id: str | None = None):
+    """R1: an email may never equal ANOTHER account's identifier.
+
+    Beyond email-vs-email uniqueness, an email equal to someone else's username
+    (e.g. 'bob@corp') would let login's email-first resolution shadow that
+    account, so it is rejected with a distinct message. `user_id` excludes the
+    caller, so an account may keep (or re-normalize) its own values. Used by
+    both email write paths and by the race classifier in the IntegrityError
+    handlers below.
+    """
+    if not email:
+        return
+    excl, args = ("", (email,)) if not user_id else (" AND id<>?", (email, user_id))
+    if c.execute(f"SELECT 1 FROM users WHERE email=?{excl}", args).fetchone():
+        raise HTTPException(409, "Email already in use")
+    if c.execute(f"SELECT 1 FROM users WHERE username=?{excl}", args).fetchone():
+        raise HTTPException(409, "Email conflicts with an existing username")
 
 
 def _session(user_id):
     with D.db() as c:
         r = c.execute(
-            "SELECT u.id,u.username,u.role,u.tenant_id,u.department,u.employee_id,"
-            "u.is_manager,t.name AS tenant_name "
+            "SELECT u.id,u.username,u.email,u.role,u.tenant_id,u.department,"
+            "u.employee_id,u.is_manager,t.name AS tenant_name "
             "FROM users u JOIN tenants t ON t.id=u.tenant_id WHERE u.id=?", (user_id,)).fetchone()
     return {"token": S.make_token(user_id), "user": dict(r)}
 
@@ -63,7 +127,14 @@ def _session(user_id):
 def login(b: Login):
     name = b.username.strip().lower(); S.check_lock(name)
     with D.db() as c:
-        r = c.execute("SELECT * FROM users WHERE username=?", (name,)).fetchone()
+        r = None
+        if "@" in name:
+            # Work-email login: the normalized email wins over any legacy
+            # username that happens to look like one; plain usernames keep
+            # the exact pre-Stage-A query (unknown emails fall back to it).
+            r = c.execute("SELECT * FROM users WHERE email=?", (name,)).fetchone()
+        if r is None:
+            r = c.execute("SELECT * FROM users WHERE username=?", (name,)).fetchone()
     if not r or not S.check_pw(b.password, r["pw_hash"]):
         S.record_fail(name); raise HTTPException(401, "Invalid username or password")
     S.clear_fail(name); D.audit(r["tenant_id"], r["id"], "login")
@@ -74,15 +145,30 @@ def login(b: Login):
 def signup_org(b: OrgSignup):
     if not ALLOW_ORG_SIGNUP:
         raise HTTPException(403, "Organization sign-up is disabled")
-    name, tid, uid = b.username.strip().lower(), D.uid(), D.uid()
-    with D.db() as c:
-        if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
-            raise HTTPException(409, "Username already taken")
-        c.execute("INSERT INTO tenants(id,name) VALUES(?,?)", (tid, b.org_name.strip()))
-        c.execute(
-            "INSERT INTO users(id,username,pw_hash,tenant_id,role,department,employee_id) VALUES(?,?,?,?,?,?,?)",
-            (uid, name, S.hash_pw(b.password), tid, "admin", "General", "ORG-ADMIN"))
-        D.seed_departments(c, tid)          # standard five departments for the new org
+    name, email = _norm_username(b.username), _norm_email(b.email)
+    tid, uid = D.uid(), D.uid()
+    try:
+        with D.db() as c:
+            if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                raise HTTPException(409, "Username already taken")
+            # R1: emails are globally unique AND may not shadow any username.
+            _assert_email_available(c, email)
+            c.execute("INSERT INTO tenants(id,name) VALUES(?,?)", (tid, b.org_name.strip()))
+            c.execute(
+                "INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department,employee_id) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (uid, name, email, S.hash_pw(b.password), tid, "admin", "General", "ORG-ADMIN"))
+            D.seed_departments(c, tid)      # standard five departments for the new org
+    except D.IntegrityError as e:
+        # R3: lost a uniqueness race. Classify in a FRESH transaction (a failed
+        # statement poisons the current one on PostgreSQL) and answer 409 with
+        # the precise reason — never a 500. The rollback above already removed
+        # the half-created tenant, so nothing partial survives.
+        with D.db() as c:
+            _assert_email_available(c, email)      # -> 409 (email or username clash)
+            if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                raise HTTPException(409, "Username already taken")
+        raise e                                     # not a uniqueness race: surface it
     D.audit(tid, uid, "org_created", b.org_name)
     return _session(uid)
 
@@ -90,7 +176,7 @@ def signup_org(b: OrgSignup):
 @app.post("/api/auth/register")
 def register(b: Register):
     """Join an existing organization with a company-issued Employee ID."""
-    name, uid = b.username.strip().lower(), D.uid()
+    name, uid = _norm_username(b.username), D.uid()
     with D.db() as c:
         inv = c.execute("SELECT * FROM invites WHERE code=?", (b.invite_code.strip(),)).fetchone()
         if not inv or inv["used_by"] or inv["expires"] < datetime.now(timezone.utc).isoformat():
@@ -580,7 +666,7 @@ def team_overview(u=Depends(S.current_user)):
 def users(u=Depends(S.admin_user)):
     with D.db() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id,username,role,department,employee_id,is_manager,created FROM users "
+            "SELECT id,username,email,role,department,employee_id,is_manager,created FROM users "
             "WHERE tenant_id=? ORDER BY created", (u["tenant_id"],))]
 
 
@@ -588,6 +674,9 @@ class UserUpdate(BaseModel):
     role: str | None = None
     department: str | None = None
     is_manager: bool | None = None
+    # Work email. Absent (old PATCH bodies) means "no change"; an explicit
+    # null (or "") clears — distinguished via b.model_fields_set below.
+    email: str | None = None
 
 
 @app.patch("/api/admin/users/{user_id}")
@@ -596,26 +685,53 @@ def update_user(user_id: str, b: UserUpdate, u=Depends(S.admin_user)):
         raise HTTPException(400, "Invalid role")
     if b.role is not None and user_id == u["id"]:
         raise HTTPException(400, "You cannot change your own role")
+    email, email_note, email_conflict = None, "", False
     with D.db() as c:
+        # Own-tenant existence check FIRST: another tenant's user is a 404,
+        # never a 409 that could confirm an email exists elsewhere.
         if not c.execute("SELECT 1 FROM users WHERE id=? AND tenant_id=?", (user_id, u["tenant_id"])).fetchone():
             raise HTTPException(404, "User not found")
-        if b.department is not None:
-            if b.department not in ("", "General") and not c.execute(
-                    "SELECT 1 FROM departments WHERE tenant_id=? AND name=?",
-                    (u["tenant_id"], b.department)).fetchone():
-                raise HTTPException(400, "Unknown department")
-            c.execute("UPDATE users SET department=? WHERE id=? AND tenant_id=?",
-                      (b.department or "General", user_id, u["tenant_id"]))
-        if b.is_manager is not None:
-            # Manager designation: workspace gate only. Changing it never
-            # touches role, department, or any document permission.
-            c.execute("UPDATE users SET is_manager=? WHERE id=? AND tenant_id=?",
-                      (1 if b.is_manager else 0, user_id, u["tenant_id"]))
-        if b.role is not None:
-            c.execute("UPDATE users SET role=? WHERE id=? AND tenant_id=?",
-                      (b.role, user_id, u["tenant_id"]))
+        if "email" in b.model_fields_set:
+            email = _norm_email(b.email)
+            # R1: global identifier rules — email-vs-email and (the shadowing
+            # case) email-vs-username; self excluded so an account may keep its
+            # own username-shaped email.
+            _assert_email_available(c, email, user_id)
+            try:
+                c.execute("UPDATE users SET email=? WHERE id=? AND tenant_id=?",
+                          (email, user_id, u["tenant_id"]))
+            except D.IntegrityError:
+                # R3: the pre-check lost a race — the CI index just fired.
+                # The failed statement rolls back by itself; skip the remaining
+                # field updates so a rejected PATCH commits NOTHING, and
+                # classify after this transaction has closed (a failed statement
+                # poisons the transaction on PostgreSQL).
+                email_conflict = True
+            else:
+                email_note = f" email={email or 'cleared'}"
+        if not email_conflict:
+            if b.department is not None:
+                if b.department not in ("", "General") and not c.execute(
+                        "SELECT 1 FROM departments WHERE tenant_id=? AND name=?",
+                        (u["tenant_id"], b.department)).fetchone():
+                    raise HTTPException(400, "Unknown department")
+                c.execute("UPDATE users SET department=? WHERE id=? AND tenant_id=?",
+                          (b.department or "General", user_id, u["tenant_id"]))
+            if b.is_manager is not None:
+                # Manager designation: workspace gate only. Changing it never
+                # touches role, department, or any document permission.
+                c.execute("UPDATE users SET is_manager=? WHERE id=? AND tenant_id=?",
+                          (1 if b.is_manager else 0, user_id, u["tenant_id"]))
+            if b.role is not None:
+                c.execute("UPDATE users SET role=? WHERE id=? AND tenant_id=?",
+                          (b.role, user_id, u["tenant_id"]))
+    if email_conflict:
+        with D.db() as c:                      # fresh transaction (PG-safe)
+            _assert_email_available(c, email, user_id)   # -> 409, precise reason
+        raise HTTPException(409, "Email already in use")  # race vanished: still a conflict
     D.audit(u["tenant_id"], u["id"], "user_updated",
-            f"{user_id} role={b.role} dept={b.department} manager={b.is_manager}")
+            f"{user_id} role={b.role} dept={b.department} "
+            f"manager={b.is_manager}{email_note}")
     return {"ok": True}
 
 

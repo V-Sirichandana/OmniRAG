@@ -7,8 +7,8 @@
  * QuickAction and a dependency-free horizontal bar chart.
  */
 import { useRouter } from "next/navigation";
-import { Loader2, type LucideIcon } from "lucide-react";
-import type { ButtonHTMLAttributes, ReactNode } from "react";
+import { Eye, EyeOff, Loader2, type LucideIcon } from "lucide-react";
+import { useState, type ButtonHTMLAttributes, type ReactNode } from "react";
 
 export function Panel({
   title,
@@ -130,12 +130,72 @@ export function Field({
 export const inputCls =
   "w-full rounded-lg border border-line-2 bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-brand-2 focus:ring-2 focus:ring-brand/20";
 
+/** Teal focus treatment for the PUBLIC auth routes (/login, /signup, /join).
+ *  Visual only — identical layout metrics to inputCls so auth and workspace
+ *  forms stay pixel-consistent; the dashboard keeps inputCls untouched. */
+export const authInputCls =
+  "w-full rounded-lg border border-line-2 bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-teal-700 focus:ring-2 focus:ring-teal-700/20";
+
 export function ErrorNote({ children }: { children?: ReactNode }) {
   if (!children) return null;
   return (
-    <p className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600">
+    <p
+      role="alert"
+      className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-600"
+    >
       {children}
     </p>
+  );
+}
+
+/** Password input with an accessible show/hide toggle (auth pages).
+ *  The toggle is type="button" (never submits) and carries its own
+ *  aria-label / aria-pressed state; the value stays controlled by the caller
+ *  exactly like a plain input. */
+export function PasswordField({
+  label = "Password",
+  hint,
+  value,
+  onChange,
+  placeholder,
+  autoComplete,
+  required = true,
+  minLength,
+}: {
+  label?: string;
+  hint?: string;
+  value: string;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  autoComplete?: string;
+  required?: boolean;
+  minLength?: number;
+}) {
+  const [show, setShow] = useState(false);
+  return (
+    <Field label={label} hint={hint}>
+      <span className="relative block">
+        <input
+          type={show ? "text" : "password"}
+          className={`${authInputCls} pr-11`}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          placeholder={placeholder}
+          required={required}
+          minLength={minLength}
+          autoComplete={autoComplete}
+        />
+        <button
+          type="button"
+          onClick={() => setShow((s) => !s)}
+          aria-label={show ? "Hide password" : "Show password"}
+          aria-pressed={show}
+          className="absolute inset-y-0 right-0 grid w-11 place-items-center rounded-r-lg text-slate-400 transition hover:text-slate-600 focus-visible:outline-2 focus-visible:outline-offset-[-2px] focus-visible:outline-teal-700"
+        >
+          {show ? <EyeOff size={16} /> : <Eye size={16} />}
+        </button>
+      </span>
+    </Field>
   );
 }
 

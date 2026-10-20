@@ -863,6 +863,522 @@ def test_admin_stats_include_storage_bytes():
     assert client.get("/api/admin/stats", headers=auth(STATE["hr"]["token"])).status_code == 403
 
 
+# --- Stage A: work-email identity -------------------------------------------
+
+@test
+def test_email_login():
+    # Org created WITH a work email (optional field — old clients send none).
+    r = client.post("/api/auth/signup-org",
+                    json={"org_name": "Mail & Co", "username": "mail_owner",
+                          "password": "mailpass123!", "email": "Owner@Mail-Co.Example"})
+    assert r.status_code == 200, r.text
+    s = r.json()
+    STATE["mailco"] = s
+    # stored normalized (trim+lowercase) and surfaced in session, me, directory
+    assert s["user"]["email"] == "owner@mail-co.example"
+    me = client.get("/api/auth/me", headers=auth(s["token"])).json()
+    assert me["email"] == "owner@mail-co.example"
+    users = {u["username"]: u for u in
+             client.get("/api/admin/users", headers=auth(s["token"])).json()}
+    assert users["mail_owner"]["email"] == "owner@mail-co.example"
+
+    # login by work email — exact, plus mixed case and surrounding spaces
+    for ident in ("owner@mail-co.example", "  OWNER@Mail-Co.Example "):
+        ok = client.post("/api/auth/login",
+                         json={"username": ident, "password": "mailpass123!"})
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["user"]["tenant_id"] == s["user"]["tenant_id"]
+    # wrong password over the email identifier stays a generic 401
+    bad = client.post("/api/auth/login",
+                      json={"username": "owner@mail-co.example", "password": "nope"})
+    assert bad.status_code == 401
+    # legacy username login works for the very same email-bearing account
+    ok = client.post("/api/auth/login",
+                     json={"username": "mail_owner", "password": "mailpass123!"})
+    assert ok.status_code == 200
+    assert ok.json()["user"]["email"] == "owner@mail-co.example"
+
+
+@test
+def test_username_login_still_works_without_email():
+    # Accounts created the old way (invite + username, NO email) are untouched.
+    inv = client.post("/api/admin/invites", headers=auth(STATE["acme"]["token"]),
+                      json={"role": "member", "department": "Engineering & Tech", "days": 7})
+    assert inv.status_code == 200, inv.text
+    reg = client.post("/api/auth/register",
+                      json={"username": "legacy_worker", "password": "legacypass1",
+                            "invite_code": inv.json()["code"]})
+    assert reg.status_code == 200, reg.text
+    assert reg.json()["user"]["email"] is None
+    # old payload, old identifier — byte-for-byte compatible behavior
+    ok = client.post("/api/auth/login",
+                     json={"username": "legacy_worker", "password": "legacypass1"})
+    assert ok.status_code == 200, ok.text
+    me = client.get("/api/auth/me", headers=auth(ok.json()["token"])).json()
+    assert me["username"] == "legacy_worker" and me["email"] is None
+
+
+@test
+def test_email_uniqueness():
+    t_acme = auth(STATE["acme"]["token"])
+    admin_id = STATE["acme"]["user"]["id"]
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+
+    # set the admin's own work email; re-setting it (normalized) stays allowed
+    r = client.patch(f"/api/admin/users/{admin_id}", headers=t_acme,
+                     json={"email": "boss@acme-corp.example"})
+    assert r.status_code == 200, r.text
+    r = client.patch(f"/api/admin/users/{admin_id}", headers=t_acme,
+                     json={"email": "BOSS@Acme-Corp.Example"})
+    assert r.status_code == 200, r.text
+
+    # global uniqueness across organizations — case-insensitive, at signup …
+    r = client.post("/api/auth/signup-org",
+                    json={"org_name": "Squat Corp", "username": "squat_admin",
+                          "password": "squatpass123", "email": "boss@acme-corp.example"})
+    assert r.status_code == 409
+    # … and via admin PATCH onto another member
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": "Boss@Acme-Corp.example"})
+    assert r.status_code == 409
+    # malformed values are rejected without writing anything
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": "not-an-email"})
+    assert r.status_code == 400
+    # set + clear (explicit null) round-trips through the directory
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": "HANA@Acme-Corp.Example"})
+    assert r.status_code == 200
+    after = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+    assert after["hana_hr"]["email"] == "hana@acme-corp.example"
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": None})
+    assert r.status_code == 200
+    after = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+    assert after["hana_hr"]["email"] is None
+    # an omitted field (old PATCH bodies) never touches the stored email
+    r = client.patch(f"/api/admin/users/{admin_id}", headers=t_acme,
+                     json={"department": "Human Resources"})
+    assert r.status_code == 200
+    after = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+    assert after["acme_admin"]["email"] == "boss@acme-corp.example"
+
+
+@test
+def test_cross_tenant_email_isolation():
+    t_acme = auth(STATE["acme"]["token"])
+    t_apex = auth(STATE["apex"]["token"])
+    acme_id = STATE["acme"]["user"]["id"]
+    acme_user = STATE["acme"]["user"]["username"]
+
+    # another organization's admin cannot touch the Acme account (404, no leak)
+    r = client.patch(f"/api/admin/users/{acme_id}", headers=t_apex,
+                     json={"email": "attacker@apex-global.example"})
+    assert r.status_code == 404
+    # Acme's own admin may set a work email
+    r = client.patch(f"/api/admin/users/{acme_id}", headers=t_acme,
+                     json={"email": "iso@acme-corp.example"})
+    assert r.status_code == 200, r.text
+
+    # the other tenant's directory lists only its own people and emails
+    apex_users = client.get("/api/admin/users", headers=t_apex).json()
+    assert "iso@acme-corp.example" not in {u.get("email") for u in apex_users}
+    assert acme_user not in {u["username"] for u in apex_users}
+
+    # logging in with that email always resolves to the OWNING tenant
+    ok = client.post("/api/auth/login",
+                     json={"username": "iso@acme-corp.example",
+                           "password": "password123!"})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["user"]["tenant_id"] == STATE["acme"]["user"]["tenant_id"]
+
+    # global uniqueness blocks the other tenant from claiming the same email
+    r = client.patch(f"/api/admin/users/{STATE['apex']['user']['id']}",
+                     headers=t_apex, json={"email": "iso@acme-corp.example"})
+    assert r.status_code == 409
+
+
+@test
+def test_init_migrates_existing_database():
+    """Stage A schema changes are additive + idempotent on a PRE-EXISTING DB."""
+    import sqlite3
+    from app import db as D
+
+    legacy = os.path.join(_TMP, "legacy_stageA.db")
+    con = sqlite3.connect(legacy)
+    con.executescript(
+        """
+        CREATE TABLE tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL,
+                             created TEXT DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE users(
+          id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, pw_hash TEXT NOT NULL,
+          tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          role TEXT NOT NULL DEFAULT 'member',
+          department TEXT NOT NULL DEFAULT 'General',
+          employee_id TEXT,
+          is_manager INTEGER NOT NULL DEFAULT 0,
+          created TEXT DEFAULT CURRENT_TIMESTAMP);
+        INSERT INTO tenants(id,name) VALUES('t_legacy','Legacy Co');
+        INSERT INTO users(id,username,pw_hash,tenant_id,role)
+            VALUES('u_legacy','old_timer','x','t_legacy','admin');
+        """)
+    con.commit()
+    con.close()
+
+    original = D.DB_PATH
+    try:
+        D.DB_PATH = legacy
+        D.init()                                   # migration run #1
+        con = sqlite3.connect(legacy)
+        # email column was added …
+        cols = {r[1] for r in con.execute("PRAGMA table_info(users)")}
+        assert "email" in cols, "email column missing on an existing database"
+        # … with a UNIQUE partial index over email …
+        idx = {r[1]: r for r in con.execute("PRAGMA index_list(users)")}
+        assert "idx_users_email" in idx and idx["idx_users_email"][2] == 1, idx
+        icols = [r[2] for r in con.execute("PRAGMA index_info(idx_users_email)")]
+        assert icols == ["email"], icols
+        # … and the R2 case-insensitive partial index alongside it
+        assert "idx_users_email_ci" in idx and idx["idx_users_email_ci"][2] == 1 \
+            and idx["idx_users_email_ci"][4] == 1, idx
+        # … while the pre-existing row is untouched (email NULL = legacy login)
+        row = con.execute(
+            "SELECT username,email,role FROM users WHERE id='u_legacy'").fetchone()
+        assert row == ("old_timer", None, "admin"), row
+        # the migrated database enforces email uniqueness …
+        con.execute(
+            "INSERT INTO users(id,username,pw_hash,tenant_id,email) "
+            "VALUES('u_e1','dup_a','x','t_legacy','same@legacy.example')")
+        con.commit()
+        try:
+            con.execute(
+                "INSERT INTO users(id,username,pw_hash,tenant_id,email) "
+                "VALUES('u_e2','dup_b','x','t_legacy','same@legacy.example')")
+            con.commit()
+            raise AssertionError("duplicate email accepted on migrated database")
+        except sqlite3.IntegrityError:
+            pass
+        finally:
+            con.close()
+        D.init()                                   # run #2: idempotent, no error
+    finally:
+        D.DB_PATH = original
+
+
+# --- Stage A hardening: R1 shadowing, R2 DB-level CI uniqueness, R3 races ----
+
+@test
+def test_email_may_not_shadow_another_username():
+    """R1: an email equal to ANOTHER account's username is rejected on both
+    email write paths; plain username login behavior stays untouched."""
+    t_acme = auth(STATE["acme"]["token"])
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+    # a member whose USERNAME looks like an email (the shadowing vector).
+    # Registration now refuses to CREATE '@'-usernames (the race fix — see
+    # test_signup_org_rejects_at_username), so the legacy account is seeded
+    # exactly as a pre-fix database still holds it: the new rule never
+    # renames, deletes or modifies existing rows, and login is unchanged.
+    import sqlite3
+    from app import db as D
+    from app import security as S
+    shadow_id = uuid.uuid4().hex
+    con = sqlite3.connect(D.DB_PATH)
+    con.execute(
+        "INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department,employee_id) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        (shadow_id, "shadow@corp", None, S.hash_pw("shadowpass1"),
+         STATE["acme"]["user"]["tenant_id"], "member", "Finance & Operations", "LEGACY"))
+    con.commit()
+    con.close()
+
+    # (a) admin PATCH may not claim that username as an email
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": "shadow@corp"})
+    assert r.status_code == 409, r.text
+    assert "username" in r.json()["detail"].lower(), r.text
+    # (b) organization signup may not claim it either (no tenant is created)
+    r = client.post("/api/auth/signup-org",
+                    json={"org_name": "Shadow Corp", "username": "shadow_admin",
+                          "password": "shadowpass1", "email": "shadow@corp"})
+    assert r.status_code == 409, r.text
+    # (c) the shadowed username still logs in exactly as before (R1 preserves
+    #     existing username login — no fallback change, no lockout)
+    ok = client.post("/api/auth/login", json={"username": "shadow@corp", "password": "shadowpass1"})
+    assert ok.status_code == 200 and ok.json()["user"]["id"] == shadow_id, ok.text
+    # (d) self-consistency stays allowed: an account may hold ITS OWN
+    #     username-shaped email (same row either way — nothing is shadowed)
+    r = client.patch(f"/api/admin/users/{shadow_id}", headers=t_acme,
+                     json={"email": "shadow@corp"})
+    assert r.status_code == 200, r.text
+    after = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+    assert after["shadow@corp"]["email"] == "shadow@corp"
+    r = client.patch(f"/api/admin/users/{shadow_id}", headers=t_acme, json={"email": None})
+    assert r.status_code == 200, r.text
+    # and email-vs-email uniqueness is untouched by R1
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": "shadow@corp"})
+    assert r.status_code == 409, r.text
+
+
+@test
+def test_email_case_insensitive_unique_at_db_level():
+    """R2: the DATABASE itself rejects case-variant emails (raw writes that
+    bypass _norm_email included); NULL emails stay unlimited."""
+    import sqlite3
+    from app import db as D
+    t_acme = auth(STATE["acme"]["token"])
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+    r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                     json={"email": "ci.probe@acme-corp.example"})
+    assert r.status_code == 200, r.text
+
+    con = sqlite3.connect(D.DB_PATH)
+    try:
+        idx = {row[1]: row for row in con.execute("PRAGMA index_list(users)")}
+        assert "idx_users_email_ci" in idx, idx
+        assert idx["idx_users_email_ci"][2] == 1, "CI index must be UNIQUE"
+        assert idx["idx_users_email_ci"][4] == 1, "CI index must be PARTIAL (NULLs allowed)"
+        # the raw database (bypassing app normalization) rejects a case variant …
+        try:
+            con.execute(
+                "INSERT INTO users(id,username,pw_hash,tenant_id,email) "
+                "VALUES('rawci1','raw_ci_probe','x',?, 'CI.PROBE@acme-corp.example')",
+                (STATE["acme"]["user"]["tenant_id"],))
+            ci_rejects = False
+        except sqlite3.IntegrityError:
+            ci_rejects = True
+        assert ci_rejects, "CI index must reject case variants at the DB level"
+        # … while NULL emails remain unlimited (every legacy account is NULL)
+        con.execute("INSERT INTO users(id,username,pw_hash,tenant_id,email) "
+                    "VALUES('rawci2','raw_ci_null_a','x',?,NULL)",
+                    (STATE["acme"]["user"]["tenant_id"],))
+        con.execute("INSERT INTO users(id,username,pw_hash,tenant_id,email) "
+                    "VALUES('rawci3','raw_ci_null_b','x',?,NULL)",
+                    (STATE["acme"]["user"]["tenant_id"],))
+    finally:
+        con.rollback()      # probes never persist — the directory stays pristine
+        con.close()
+
+
+@test
+def test_init_stops_safely_on_case_variant_duplicates():
+    """R2: if existing data already holds case-variant duplicate emails, init()
+    must stop loudly and change nothing — never delete or rewrite users."""
+    import sqlite3
+    from app import db as D
+    legacy = os.path.join(_TMP, "legacy_ci_dupes.db")
+    con = sqlite3.connect(legacy)
+    con.executescript(
+        """
+        CREATE TABLE tenants(id TEXT PRIMARY KEY, name TEXT NOT NULL);
+        CREATE TABLE users(
+          id TEXT PRIMARY KEY, username TEXT UNIQUE NOT NULL, email TEXT, pw_hash TEXT NOT NULL,
+          tenant_id TEXT NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+          role TEXT NOT NULL DEFAULT 'member', department TEXT NOT NULL DEFAULT 'General',
+          employee_id TEXT, is_manager INTEGER NOT NULL DEFAULT 0,
+          created TEXT DEFAULT CURRENT_TIMESTAMP);
+        INSERT INTO tenants(id,name) VALUES('t1','Dupe Co');
+        INSERT INTO users(id,username,pw_hash,tenant_id,email)
+            VALUES('u1','dup_a','x','t1','Same@Dupe.example');
+        INSERT INTO users(id,username,pw_hash,tenant_id,email)
+            VALUES('u2','dup_b','x','t1','same@dupe.example');
+        """)
+    con.commit(); con.close()
+
+    original = D.DB_PATH
+    try:
+        D.DB_PATH = legacy
+        try:
+            D.init()
+            raise AssertionError("init() must refuse to index case-variant duplicate emails")
+        except RuntimeError as e:
+            # actionable report: names the normalized conflicting value
+            assert "same@dupe.example" in str(e) and "No data was changed" in str(e), e
+        con = sqlite3.connect(legacy)
+        rows = sorted(con.execute("SELECT id,username,email FROM users").fetchall())
+        assert rows == [("u1", "dup_a", "Same@Dupe.example"),
+                        ("u2", "dup_b", "same@dupe.example")], rows
+        idx = {r[1] for r in con.execute("PRAGMA index_list(users)")}
+        assert "idx_users_email_ci" not in idx, "CI index must not exist after the refusal"
+        con.close()
+        # once an admin clears the duplicate, init() completes and adds it
+        con = sqlite3.connect(legacy)
+        con.execute("UPDATE users SET email=NULL WHERE id='u2'")
+        con.commit(); con.close()
+        D.init()
+        con = sqlite3.connect(legacy)
+        idx = {r[1] for r in con.execute("PRAGMA index_list(users)")}
+        assert "idx_users_email_ci" in idx, idx
+        assert con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 2
+        assert con.execute("SELECT email FROM users WHERE id='u1'").fetchone()[0] \
+            == "Same@Dupe.example"          # surviving data untouched
+        con.close()
+    finally:
+        D.DB_PATH = original
+
+
+@test
+def test_email_uniqueness_race_returns_409_not_500():
+    """R3: when the availability pre-check loses a race, the database
+    constraint fires and the endpoint answers 409 (precise message), never
+    500. Deterministic: the pre-check is disabled for the racing request only,
+    simulating a concurrent writer committing between check and write."""
+    import app.main as M
+    t_acme = auth(STATE["acme"]["token"])
+    users = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+
+    original = M._assert_email_available
+    # Explicit per-call script for the six availability checks these four
+    # requests perform (pre-check, then classifier on the losing ones):
+    #   PATCH fin_user  -> pre-check (honor: value free, write wins the race)
+    #   PATCH hana_hr   -> pre-check (BLIND), classifier (honor -> precise 409)
+    #   signup Race     -> pre-check (honor: value free, INSERT wins)
+    #   signup Race II  -> pre-check (BLIND), classifier (honor -> precise 409)
+    script = iter(["honor", "blind", "honor", "honor", "blind", "honor"])
+
+    def raced_precheck(c, email, user_id=None):
+        if next(script) == "blind":
+            return                      # pre-check "lost the race": let the write hit the CI index
+        return original(c, email, user_id)
+
+    M._assert_email_available = raced_precheck
+    try:
+        # admin path: first write wins; the racing second write hits the CI index
+        r = client.patch(f"/api/admin/users/{users['fin_user']['id']}", headers=t_acme,
+                         json={"email": "race@acme-corp.example"})
+        assert r.status_code == 200, r.text
+        r = client.patch(f"/api/admin/users/{users['hana_hr']['id']}", headers=t_acme,
+                         json={"email": "RACE@acme-corp.example"})
+        assert r.status_code == 409, r.text
+        assert "already in use" in r.json()["detail"], r.text
+        # the losing PATCH committed NOTHING (email, and no partial effects)
+        after = {u["username"]: u for u in client.get("/api/admin/users", headers=t_acme).json()}
+        assert after["hana_hr"]["email"] != "race@acme-corp.example"
+        assert after["fin_user"]["email"] == "race@acme-corp.example"
+        # signup path: same guarantee for organization creation
+        r = client.post("/api/auth/signup-org",
+                        json={"org_name": "Race Corp", "username": "race_owner",
+                              "password": "racepass123", "email": "race2@race.example"})
+        assert r.status_code == 200, r.text
+        r = client.post("/api/auth/signup-org",
+                        json={"org_name": "Race Corp II", "username": "race_owner2",
+                              "password": "racepass123", "email": "Race2@Race.Example"})
+        assert r.status_code == 409, r.text
+        assert "already in use" in r.json()["detail"], r.text
+    finally:
+        M._assert_email_available = original
+
+
+@test
+def test_signup_org_rejects_at_username():
+    """Race fix: NEW usernames may not contain '@'. Org signup validates
+    before any write — no tenant row and no user row is ever created."""
+    import sqlite3
+    from app import db as D
+    con = sqlite3.connect(D.DB_PATH)
+    t_before = con.execute("SELECT COUNT(*) FROM tenants").fetchone()[0]
+    u_before = con.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    con.close()
+    # with an (otherwise valid) email in the body
+    r = client.post("/api/auth/signup-org",
+                    json={"org_name": "At Sign Corp", "username": "at@admin",
+                          "password": "password123!",
+                          "email": "at_admin@at-sign.example"})
+    assert r.status_code == 400, r.text
+    assert "must not contain '@'" in r.json()["detail"], r.text
+    # and without one — same rule, same result
+    r = client.post("/api/auth/signup-org",
+                    json={"org_name": "At Sign Corp 2", "username": "other@name",
+                          "password": "password123!"})
+    assert r.status_code == 400, r.text
+    con = sqlite3.connect(D.DB_PATH)
+    assert not con.execute(
+        "SELECT 1 FROM tenants WHERE name LIKE 'At Sign Corp%'").fetchone()
+    assert not con.execute(
+        "SELECT 1 FROM users WHERE username IN ('at@admin','other@name')").fetchone()
+    assert con.execute("SELECT COUNT(*) FROM tenants").fetchone()[0] == t_before
+    assert con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == u_before
+    con.close()
+
+
+@test
+def test_register_rejects_at_username_and_keeps_invite():
+    """Race fix on the invitation path: '@' usernames 400 BEFORE any database
+    work, no user row exists, the invitation is not consumed — and the very
+    same invite stays fully usable afterwards (zero side effects)."""
+    import sqlite3
+    from app import db as D
+    t_acme = auth(STATE["acme"]["token"])
+    inv = client.post("/api/admin/invites", headers=t_acme,
+                      json={"role": "member", "department": "Marketing & Sales", "days": 7})
+    assert inv.status_code == 200, inv.text
+    code = inv.json()["code"]
+    r = client.post("/api/auth/register",
+                    json={"username": "member@corp", "password": "password123!",
+                          "invite_code": code})
+    assert r.status_code == 400, r.text
+    assert "must not contain '@'" in r.json()["detail"], r.text
+    con = sqlite3.connect(D.DB_PATH)
+    assert not con.execute(
+        "SELECT 1 FROM users WHERE username='member@corp'").fetchone()
+    row = con.execute("SELECT used_by FROM invites WHERE code=?", (code,)).fetchone()
+    assert row is not None and row[0] is None      # invite untouched, unconsumed
+    con.close()
+    ok = client.post("/api/auth/register",
+                     json={"username": "new_marketer", "password": "password123!",
+                           "invite_code": code})
+    assert ok.status_code == 200, ok.text
+    con = sqlite3.connect(D.DB_PATH)
+    row = con.execute("SELECT used_by FROM invites WHERE code=?", (code,)).fetchone()
+    assert row[0] == ok.json()["user"]["id"]       # consumed only by the valid use
+    con.close()
+
+
+@test
+def test_at_username_rejected_even_with_prechecks_blinded():
+    """The rule is value-based, not check-based: with every cross-row pre-check
+    blinded (the TOCTOU technique), '@' usernames are still refused — so no
+    concurrent interleaving can create one. Legacy '@' accounts keep working,
+    and restored pre-checks still accept a valid registration."""
+    import sqlite3
+    from app import db as D
+    from app import main as M
+    t_acme = auth(STATE["acme"]["token"])
+    inv = client.post("/api/admin/invites", headers=t_acme,
+                      json={"role": "member", "department": "Legal & Compliance", "days": 7})
+    assert inv.status_code == 200, inv.text
+    code = inv.json()["code"]
+    original = M._assert_email_available
+    M._assert_email_available = lambda *a, **k: None
+    try:
+        r = client.post("/api/auth/register",
+                        json={"username": "blind@corp", "password": "password123!",
+                              "invite_code": code})
+        assert r.status_code == 400, r.text
+        r = client.post("/api/auth/signup-org",
+                        json={"org_name": "Blind Corp", "username": "blind@admin",
+                              "password": "password123!"})
+        assert r.status_code == 400, r.text
+    finally:
+        M._assert_email_available = original
+    con = sqlite3.connect(D.DB_PATH)
+    assert not con.execute(
+        "SELECT 1 FROM tenants WHERE name='Blind Corp'").fetchone()
+    assert not con.execute(
+        "SELECT 1 FROM users WHERE username IN ('blind@corp','blind@admin')").fetchone()
+    assert con.execute("SELECT used_by FROM invites WHERE code=?",
+                       (code,)).fetchone()[0] is None
+    con.close()
+    ok = client.post("/api/auth/register",
+                     json={"username": "blind_ok_user", "password": "password123!",
+                           "invite_code": code})
+    assert ok.status_code == 200, ok.text
+    # legacy behavior intact end-to-end: the seeded '@' account still logs in
+    legacy = client.post("/api/auth/login",
+                         json={"username": "shadow@corp", "password": "shadowpass1"})
+    assert legacy.status_code == 200, legacy.text
+
+
 def main():
     failed = 0
     for fn in TESTS:

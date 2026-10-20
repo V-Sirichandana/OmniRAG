@@ -31,6 +31,9 @@ const Ctx = createContext<AuthCtx>({
   logout: () => {},
 });
 
+/** Unauthenticated visitors may view these; everything else needs a session. */
+const PUBLIC_ROUTES = new Set(["/login", "/signup", "/join"]);
+
 export function useAuth() {
   return useContext(Ctx);
 }
@@ -76,8 +79,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [router]);
 
   // Guard: any (shell) page without a session bounces to /login.
+  // The public onboarding routes render their own forms (their own shells
+  // redirect already-signed-in visitors to /dashboard); everything else
+  // still requires a session here — real enforcement stays on the backend.
   useEffect(() => {
-    if (!loading && !user && pathname !== "/login") router.replace("/login");
+    if (!loading && !user && !PUBLIC_ROUTES.has(pathname))
+      router.replace("/login");
   }, [loading, user, pathname, router]);
 
   return <Ctx.Provider value={{ user, loading, login, logout }}>{children}</Ctx.Provider>;
