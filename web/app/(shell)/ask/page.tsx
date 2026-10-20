@@ -17,12 +17,15 @@ import {
   ShieldQuestion,
   Sparkles,
 } from "lucide-react";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, errorToMessage } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { ChatResponse, Message, Providers } from "@/lib/types";
 import { ErrorNote } from "@/components/ui";
 
 const LANGUAGES = ["English", "Español", "Français", "हिन्दी"];
+
+/** Composer grows up to this height (matches `max-h-40`) before scrolling. */
+const COMPOSER_MAX_PX = 160;
 
 const SUGGESTIONS = [
   "What is the parental leave policy?",
@@ -50,6 +53,7 @@ function AskPage() {
   const [language, setLanguage] = useState("English");
   const [providers, setProviders] = useState<Providers | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
   // conversation id created by the current session's first send — its local
   // transcript is authoritative and must not be clobbered by a refetch race
   const createdRef = useRef<string | null>(null);
@@ -84,6 +88,19 @@ function AskPage() {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
   }, [messages, busy]);
 
+  // Composer stays one compact line and grows with the message up to
+  // COMPOSER_MAX_PX, then scrolls internally. Runs on every input change —
+  // typing and the programmatic clear after a successful send.
+  useEffect(() => {
+    const el = composerRef.current;
+    if (!el) return;
+    const border =
+      parseFloat(getComputedStyle(el).borderTopWidth) +
+      parseFloat(getComputedStyle(el).borderBottomWidth);
+    el.style.height = "auto"; // collapse to content, then measure
+    el.style.height = `${Math.min(el.scrollHeight + border, COMPOSER_MAX_PX)}px`;
+  }, [input]);
+
   const send = useCallback(
     async (text?: string) => {
       const q = (text ?? input).trim();
@@ -105,7 +122,7 @@ function AskPage() {
         }
         window.dispatchEvent(new Event("omnirag:changed")); // refresh sidebar list
       } catch (e) {
-        setError(e instanceof ApiError ? e.message : "Request failed — is the backend running?");
+        setError(errorToMessage(e)); // normalized string — never "[object Object]"
         setMessages((m) => m.slice(0, -1)); // roll back the optimistic user bubble
       } finally {
         setBusy(false);
@@ -234,7 +251,7 @@ function AskPage() {
           {busy && (
             <div className="flex items-center gap-2 text-xs text-slate-500">
               <span className="h-2 w-2 animate-ping rounded-full bg-brand-2" />
-              Retrieving, reranking and verifying…
+              Thinking…
             </div>
           )}
 
@@ -253,7 +270,8 @@ function AskPage() {
           }}
         >
           <textarea
-            rows={2}
+            ref={composerRef}
+            rows={1}
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
@@ -263,12 +281,12 @@ function AskPage() {
               }
             }}
             placeholder="Ask anything about your organization's documents…"
-            className="max-h-40 min-h-[52px] flex-1 resize-none rounded-xl border border-line-2 bg-white px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-brand-2 focus:ring-2 focus:ring-brand/20"
+            className="max-h-40 min-h-[46px] flex-1 resize-none rounded-xl border border-line-2 bg-white px-4 py-3 text-sm text-slate-900 placeholder:text-slate-400 outline-none focus:border-brand-2 focus:ring-2 focus:ring-brand/20"
           />
           <button
             type="submit"
             disabled={busy || !input.trim()}
-            className="flex h-[52px] items-center gap-2 rounded-xl bg-brand px-5 text-sm font-semibold text-white transition hover:bg-brand-2 disabled:opacity-40"
+            className="flex h-[46px] items-center gap-2 rounded-xl bg-brand px-5 text-sm font-semibold text-white transition hover:bg-brand-2 disabled:opacity-40"
           >
             Send <CornerDownLeft size={14} />
           </button>
