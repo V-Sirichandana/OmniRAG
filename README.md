@@ -97,7 +97,7 @@ browser ──► Next.js (web/)  ──/api rewrite──►  FastAPI (backend/
 │   │   ├── agent.py      # LangGraph planner/retriever/answerer/verifier
 │   │   ├── llm.py        # provider failover
 │   │   └── config.py     # env-driven configuration
-│   ├── tests/test_api.py # 59 end-to-end API checks (no network needed)
+│   ├── tests/test_api.py # 61 end-to-end API checks (no network needed)
 │   ├── requirements.txt
 │   └── .env.example      # copy to .env and fill in
 └── legacy/               # original Vite prototype (superseded, kept for reference)
@@ -165,7 +165,7 @@ Run the API test suite (isolated temp DB, no network, no keys needed):
 
 ```powershell
 cd backend
-python tests/test_api.py        # 59/59: auth, tenant isolation, ACL, retrieval, admin…
+python tests/test_api.py        # 61/61: auth, tenant isolation, ACL, retrieval, admin…
 ```
 
 ## Deploying to Vercel
