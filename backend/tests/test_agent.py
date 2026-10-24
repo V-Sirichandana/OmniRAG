@@ -768,6 +768,63 @@ def test_clean_markers_keeps_legitimate_bracketed_numbers():
     stripped = A.clean_markers("Two approvals are required. [1][2]")
     assert "[1]" not in stripped and "[2]" not in stripped, stripped
 
+@test
+def test_casual_gate_covers_compliments_reactions_and_variants():
+    from app import agent as A
+    casuals = [
+        "nice", "good", "great", "awesome", "amazing", "perfect", "excellent",
+        "fantastic", "super", "lovely", "beautiful", "well done", "good job",
+        "nice work", "great job", "nice one", "wow", "cool",
+        "waste fellow", "waste", "lol", "haha", "hehe",
+        "understood", "noted", "sure", "alright", "fine", "makes sense", "i see",
+        "cheers", "appreciate it", "thanks a lot", "thank you so much",
+        "thaaanks", "niiice", "okkkk", "thankyou", "gotit",
+        "thanks andi", "ok andi", "sare", "bagundhi", "chala bagundhi",
+        "super andi", "nice andi", "good andi", "hi andi", "hello andi",
+        "namaste andi", "sare andi",
+        "hi", "HI!", "thanks", "thank you!", "tq", "got it", "ok", "okay", "k",
+        "hello", "hey", "hiya", "howdy", "good morning", "good evening",
+        "namaste", "namaskaram", "okie", "kk", "hmm", "aha",
+        "ok thanks", "okay thanks", "ok thank you",
+    ]
+    for q in casuals:
+        assert A.casual_reply(q) is not None, "should be casual: %r" % q
+    for q in ("నమస్కారం",
+              "ధన్యవాదాలు",
+              "సరే", "చాలా బాగుంది"):
+        assert A.casual_reply(q) is not None, "should be casual (telugu): %r" % q
+    for q in ("  NICE  ", "nice!", "NICE.", "thaaanks!", "OK??", "  thanks  ",
+              "thank   you", "Got   It.", "hi!!", "waste   fellow!!!"):
+        assert A.casual_reply(q) is not None, "should be casual: %r" % q
+    non_casual = [
+        "nice summary of the policy",
+        "nice, what is the leave policy?",
+        "thanks, what is the leave policy?",
+        "thank you, what is the parental leave policy?",
+        "thankyou, what is the parental leave policy?",
+        "okay, what is the parental leave policy?",
+        "hi, how many paid vacation days do we get?",
+        "thanks - how many approvals do deployments need?",
+        "What is the parental leave policy?",
+        "Does the company offer paternity leave?",
+        "okay so what does the deployment policy require?",
+        "tqvm", "hi there", "",
+        "nice document about parental leave",
+    ]
+    for q in non_casual:
+        assert A.casual_reply(q) is None, "must not be casual: %r" % q
+
+
+@test
+def test_casual_reactions_skip_retrieval_and_the_model():
+    _reset_llm()
+    for q in ("nice", "  NICE!  ", "waste fellow", "good", "great", "understood"):
+        calls_before = len(CALLS)
+        r = _run_as("hr_member", q)
+        assert r["abstained"] is False, (q, r)
+        assert r["evidence"] == [] and r["providers"] == "", (q, r)
+        assert len(CALLS) == calls_before, "an LLM call was issued for %r" % q
+
 
 def main():
     print("Agent pipeline tests (offline, stubbed LLM)")

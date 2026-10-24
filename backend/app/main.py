@@ -5,7 +5,7 @@ All endpoints are tenant-scoped: every query filters by the caller's
 organization's documents, conversations or users. Department visibility is
 enforced here (server-side), never only in the UI.
 """
-import json, mimetypes, os, secrets, string, time
+import json, mimetypes, os, secrets, string, time, csv, io
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -73,6 +73,41 @@ def _norm_email(v) -> str | None:
     if not local or not domain:
         raise HTTPException(400, "Invalid email address")
     return e
+
+
+def _norm_date(v) -> str | None:
+    """Normalize an agreement date to ISO YYYY-MM-DD, or None if empty.
+
+    Raises 400 on malformed values. Uses datetime.date.fromisoformat (Python 3.7+).
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    try:
+        from datetime import date
+        d = date.fromisoformat(s)
+    except ValueError:
+        raise HTTPException(400, "Invalid date (expected YYYY-MM-DD)")
+    return d.isoformat()
+
+
+def _agreement_status(emp_type, start, end) -> str:
+    """Derive Active / Expiring Soon / Expired from agreement_end (if any)."""
+    if not end:
+        return "Active"
+    try:
+        from datetime import date, timedelta
+        e = date.fromisoformat(end)
+    except ValueError:
+        return "Active"
+    today = date.today()
+    if e < today:
+        return "Expired"
+    if e <= today + timedelta(days=30):
+        return "Expiring Soon"
+    return "Active"
 
 
 def _norm_username(v) -> str:
@@ -193,8 +228,12 @@ def register(b: Register):
                          (uid, code)).rowcount != 1:
                 raise HTTPException(400, "Employee ID is invalid or expired")
             c.execute(
-                "INSERT INTO users(id,username,pw_hash,tenant_id,role,department,employee_id) VALUES(?,?,?,?,?,?,?)",
-                (uid, name, S.hash_pw(b.password), inv["tenant_id"], inv["role"], dept, code))
+                "INSERT INTO users(id,username,pw_hash,tenant_id,role,department,employee_id,"
+                "full_name,email,employment_type,agreement_start,agreement_end) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (uid, name, S.hash_pw(b.password), inv["tenant_id"], inv["role"], dept, code,
+                 inv["full_name"], inv["email"], inv["employment_type"] or "full_time",
+                 inv["agreement_start"], inv["agreement_end"]))
     except D.IntegrityError:
         # Lost a uniqueness race on username: classify as 409, never a raw 500.
         with D.db() as c:
@@ -725,7 +764,8 @@ def team_overview(u=Depends(S.current_user)):
 def users(u=Depends(S.admin_user)):
     with D.db() as c:
         return [dict(r) for r in c.execute(
-            "SELECT id,username,email,role,department,employee_id,is_manager,created FROM users "
+            "SELECT id,username,email,role,department,employee_id,is_manager,created,"
+            "full_name,employment_type,agreement_start,agreement_end FROM users "
             "WHERE tenant_id=? ORDER BY created", (u["tenant_id"],))]
 
 
@@ -736,6 +776,11 @@ class UserUpdate(BaseModel):
     # Work email. Absent (old PATCH bodies) means "no change"; an explicit
     # null (or "") clears — distinguished via b.model_fields_set below.
     email: str | None = None
+    # Employment agreement tracking (additive).
+    full_name: str | None = None
+    employment_type: str | None = None
+    agreement_start: str | None = None
+    agreement_end: str | None = None
 
 
 @app.patch("/api/admin/users/{user_id}")
@@ -784,6 +829,23 @@ def update_user(user_id: str, b: UserUpdate, u=Depends(S.admin_user)):
             if b.role is not None:
                 c.execute("UPDATE users SET role=? WHERE id=? AND tenant_id=?",
                           (b.role, user_id, u["tenant_id"]))
+            # Employment agreement tracking (additive fields).
+            if "full_name" in b.model_fields_set:
+                c.execute("UPDATE users SET full_name=? WHERE id=? AND tenant_id=?",
+                          ((b.full_name or "").strip() or None, user_id, u["tenant_id"]))
+            if b.employment_type is not None:
+                if b.employment_type not in ("full_time", "contract", "intern", "fixed_term"):
+                    raise HTTPException(400, "Invalid employment type")
+                c.execute("UPDATE users SET employment_type=? WHERE id=? AND tenant_id=?",
+                          (b.employment_type, user_id, u["tenant_id"]))
+            if "agreement_start" in b.model_fields_set:
+                v = _norm_date(b.agreement_start)
+                c.execute("UPDATE users SET agreement_start=? WHERE id=? AND tenant_id=?",
+                          (v, user_id, u["tenant_id"]))
+            if "agreement_end" in b.model_fields_set:
+                v = _norm_date(b.agreement_end)
+                c.execute("UPDATE users SET agreement_end=? WHERE id=? AND tenant_id=?",
+                          (v, user_id, u["tenant_id"]))
     if email_conflict:
         with D.db() as c:                      # fresh transaction (PG-safe)
             _assert_email_available(c, email, user_id)   # -> 409, precise reason
@@ -821,6 +883,12 @@ class Invite(BaseModel):
     department: str = "Engineering & Tech"
     days: int = Field(7, ge=1, le=30)
     code: str | None = None
+    # Optional bulk-onboarding metadata (copied to the user on registration).
+    full_name: str | None = None
+    email: str | None = None
+    employment_type: str = "full_time"
+    agreement_start: str | None = None
+    agreement_end: str | None = None
 
 
 @app.post("/api/admin/invites")
@@ -828,6 +896,11 @@ def make_invite(b: Invite, u=Depends(S.admin_user)):
     """Issue a corporate Employee ID (e.g. ENG-482910) for a department."""
     role = b.role if b.role in ("admin", "member") else "member"
     dept = (b.department or "").strip()
+    emp_type = b.employment_type if b.employment_type in ("full_time", "contract", "intern", "fixed_term") else "full_time"
+    ag_start = _norm_date(b.agreement_start)
+    ag_end = _norm_date(b.agreement_end)
+    full_name = (b.full_name or "").strip() or None
+    email = _norm_email(b.email) if (b.email is not None and str(b.email).strip() != "") else None
     with D.db() as c:
         if dept and not c.execute("SELECT 1 FROM departments WHERE tenant_id=? AND name=?",
                                   (u["tenant_id"], dept)).fetchone():
@@ -843,8 +916,12 @@ def make_invite(b: Invite, u=Depends(S.admin_user)):
             code = f"{prefix}-{''.join(secrets.choice(string.digits) for _ in range(6))}"
         exp = (datetime.now(timezone.utc) + timedelta(days=b.days)).isoformat()
         try:
-            c.execute("INSERT INTO invites(code,tenant_id,role,department,created_by,expires) VALUES(?,?,?,?,?,?)",
-                      (code, u["tenant_id"], role, dept, u["id"], exp))
+            c.execute(
+                "INSERT INTO invites(code,tenant_id,role,department,created_by,expires,"
+                "full_name,email,employment_type,agreement_start,agreement_end) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (code, u["tenant_id"], role, dept, u["id"], exp,
+                 full_name, email, emp_type, ag_start, ag_end))
         except D.IntegrityError:
             # lost a code-collision race (custom or generated code) — 409, never a 500
             raise HTTPException(409, "Employee ID already exists")
@@ -861,6 +938,206 @@ def invites(u=Depends(S.admin_user)):
                FROM invites i LEFT JOIN users u ON u.id=i.used_by
                WHERE i.tenant_id=? ORDER BY i.expires DESC LIMIT 30""", (u["tenant_id"],))]
 
+
+# ── Bulk employee onboarding (CSV) ──────────────────────────────────────────
+_CSV_TEMPLATE = "employee_id,full_name,work_email,department,role,employment_type,agreement_start,agreement_end\n"
+_CSV_HEADERS = ["employee_id", "full_name", "work_email", "department", "role",
+                "employment_type", "agreement_start", "agreement_end"]
+_VALID_EMP_TYPES = ("full_time", "contract", "intern", "fixed_term")
+
+
+def _parse_csv_bytes(data: bytes):
+    text = data.decode("utf-8-sig", errors="replace")
+    reader = csv.DictReader(io.StringIO(text))
+    if reader.fieldnames is None:
+        return None, "Empty or unreadable CSV file"
+    alias = {"employee id": "employee_id", "employeeid": "employee_id",
+             "name": "full_name", "employee_name": "full_name", "email": "work_email",
+             "work email": "work_email", "emp_type": "employment_type",
+             "start": "agreement_start", "end": "agreement_end",
+             "agreement end": "agreement_end", "agreement start": "agreement_start"}
+    header_map = {}
+    for orig in reader.fieldnames:
+        n = (orig or "").strip().lower().replace(" ", "_")
+        header_map[orig] = alias.get(n, n)
+    rows = []
+    for raw in reader:
+        row = {}
+        for k, v in raw.items():
+            nk = header_map.get(k, (k or "").strip().lower().replace(" ", "_"))
+            row[nk] = (v or "").strip()
+        rows.append(row)
+    header_keys = set(header_map.values())
+    if "employee_id" not in header_keys or "department" not in header_keys:
+        return None, "CSV must include 'employee_id' and 'department' columns"
+    return rows, None
+
+
+def _validate_csv_row(row, tenant_id, seen_ids, seen_emails, depts):
+    errors = []
+    eid = (row.get("employee_id") or "").strip()
+    if not eid:
+        errors.append("employee_id is required")
+    elif len(eid) > 32:
+        errors.append("employee_id too long (max 32)")
+    name = (row.get("full_name") or "").strip() or None
+    email_raw = (row.get("work_email") or "").strip()
+    email = None
+    if email_raw:
+        try:
+            email = _norm_email(email_raw)
+        except HTTPException as e:
+            errors.append("invalid email: %s" % e.detail)
+    dept = (row.get("department") or "").strip()
+    if not dept:
+        errors.append("department is required")
+    elif dept not in depts:
+        errors.append("unknown department: %s" % dept)
+    role = (row.get("role") or "member").strip().lower() or "member"
+    if role not in ("admin", "member"):
+        errors.append("role must be 'admin' or 'member'")
+        role = "member"
+    emp_type = (row.get("employment_type") or "full_time").strip().lower() or "full_time"
+    if emp_type not in _VALID_EMP_TYPES:
+        errors.append("employment_type must be full_time/contract/intern/fixed_term")
+        emp_type = "full_time"
+    ag_start = None
+    ag_end = None
+    if (row.get("agreement_start") or "").strip():
+        try:
+            ag_start = _norm_date(row.get("agreement_start"))
+        except HTTPException as e:
+            errors.append("invalid agreement_start: %s" % e.detail)
+    if (row.get("agreement_end") or "").strip():
+        try:
+            ag_end = _norm_date(row.get("agreement_end"))
+        except HTTPException as e:
+            errors.append("invalid agreement_end: %s" % e.detail)
+    if ag_start and ag_end and ag_start > ag_end:
+        errors.append("agreement_start must be <= agreement_end")
+
+    status = "valid"
+    if eid:
+        if eid in seen_ids:
+            status = "duplicate"
+            errors.append("duplicate employee_id in file")
+        seen_ids.add(eid)
+    if email:
+        if email in seen_emails:
+            status = "duplicate"
+            errors.append("duplicate email in file")
+        seen_emails.add(email)
+    if not errors and eid:
+        with D.db() as c:
+            if c.execute("SELECT 1 FROM invites WHERE code=? AND tenant_id=?", (eid, tenant_id)).fetchone():
+                status = "existing"
+                errors.append("employee_id already issued")
+            if c.execute("SELECT 1 FROM users WHERE employee_id=? AND tenant_id=?", (eid, tenant_id)).fetchone():
+                status = "existing"
+                errors.append("employee already has an account")
+            if email and c.execute("SELECT 1 FROM users WHERE email=? AND tenant_id=?", (email, tenant_id)).fetchone():
+                status = "existing"
+                errors.append("email already registered")
+    if errors and status == "valid":
+        status = "invalid"
+    return {
+        "employee_id": eid,
+        "full_name": name,
+        "work_email": email,
+        "department": dept,
+        "role": role,
+        "employment_type": emp_type,
+        "agreement_start": ag_start,
+        "agreement_end": ag_end,
+    }, status, errors
+
+
+@app.get("/api/admin/onboarding/template")
+def onboarding_template(u=Depends(S.admin_user)):
+    return Response(
+        content=_CSV_TEMPLATE,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="employee_onboarding_template.csv"'})
+
+
+@app.post("/api/admin/onboarding/preview")
+async def onboarding_preview(file: UploadFile = File(...), u=Depends(S.admin_user)):
+    data = await file.read()
+    if len(data) > 2 * 1024 * 1024:
+        raise HTTPException(413, "File too large")
+    rows, err = _parse_csv_bytes(data)
+    if err:
+        raise HTTPException(400, err)
+    with D.db() as c:
+        depts = {r["name"] for r in c.execute(
+            "SELECT name FROM departments WHERE tenant_id=?", (u["tenant_id"],))}
+    seen_ids, seen_emails = set(), set()
+    results = []
+    for i, row in enumerate(rows, start=2):
+        data_row, status, errors = _validate_csv_row(row, u["tenant_id"], seen_ids, seen_emails, depts)
+        results.append({"row": i, "status": status, "errors": errors, "data": data_row})
+    summary = {
+        "total": len(results),
+        "valid": sum(1 for r in results if r["status"] == "valid"),
+        "invalid": sum(1 for r in results if r["status"] == "invalid"),
+        "duplicate": sum(1 for r in results if r["status"] == "duplicate"),
+        "existing": sum(1 for r in results if r["status"] == "existing"),
+    }
+    return {"rows": results, "summary": summary}
+
+
+@app.post("/api/admin/onboarding/import")
+async def onboarding_import(file: UploadFile = File(...), u=Depends(S.admin_user)):
+    data = await file.read()
+    if len(data) > 2 * 1024 * 1024:
+        raise HTTPException(413, "File too large")
+    rows, err = _parse_csv_bytes(data)
+    if err:
+        raise HTTPException(400, err)
+    with D.db() as c:
+        depts = {r["name"] for r in c.execute(
+            "SELECT name FROM departments WHERE tenant_id=?", (u["tenant_id"],))}
+    seen_ids, seen_emails = set(), set()
+    results = []
+    created = 0
+    for i, row in enumerate(rows, start=2):
+        data_row, status, errors = _validate_csv_row(row, u["tenant_id"], seen_ids, seen_emails, depts)
+        code = None
+        if status == "valid":
+            code = data_row["employee_id"] or None
+            if not code:
+                prefix = DEPT_PREFIXES.get(data_row["department"], "EMP")
+                code = "%s-%s" % (prefix, "".join(secrets.choice(string.digits) for _ in range(6)))
+            with D.db() as c:
+                if c.execute("SELECT 1 FROM invites WHERE code=?", (code,)).fetchone():
+                    code = "%s-%s" % (DEPT_PREFIXES.get(data_row["department"], "EMP"),
+                                       "".join(secrets.choice(string.digits) for _ in range(6)))
+                try:
+                    c.execute(
+                        "INSERT INTO invites(code,tenant_id,role,department,created_by,expires,"
+                        "full_name,email,employment_type,agreement_start,agreement_end) "
+                        "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                        (code, u["tenant_id"], data_row["role"], data_row["department"], u["id"],
+                         (datetime.now(timezone.utc) + timedelta(days=7)).isoformat(),
+                         data_row["full_name"], data_row["work_email"], data_row["employment_type"],
+                         data_row["agreement_start"], data_row["agreement_end"]))
+                    created += 1
+                except D.IntegrityError:
+                    status = "existing"
+                    errors = ["employee_id already issued"]
+                    code = None
+        results.append({"row": i, "status": status, "errors": errors,
+                        "employee_id": data_row["employee_id"], "code": code})
+    summary = {
+        "total": len(results),
+        "created": created,
+        "valid": sum(1 for r in results if r["status"] == "valid"),
+        "invalid": sum(1 for r in results if r["status"] == "invalid"),
+        "duplicate": sum(1 for r in results if r["status"] == "duplicate"),
+        "existing": sum(1 for r in results if r["status"] == "existing"),
+    }
+    D.audit(u["tenant_id"], u["id"], "bulk_onboard", "created=%d total=%d" % (created, len(results)))
+    return {"rows": results, "summary": summary}
 
 @app.get("/api/admin/audit")
 def audit_log(u=Depends(S.admin_user)):

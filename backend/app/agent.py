@@ -52,34 +52,94 @@ _CITE = re.compile(r"(?:\s*【\d+†[^】]*】)+|(?:\s*\[[1-9]\d?\])+")
 _GREETING = "Hello! How can I help you with your organization's documents today?"
 _ACK = "Understood — let me know what you'd like to find in your documents."
 _THANKS = "You're welcome! Let me know if you have any other questions."
+_COMPLIMENT = "Glad to hear it! Let me know if you'd like to look anything up in your documents."
+_REACT = "I'm here to help with your organization's documents — ask me anything about them."
 
-_CASUAL = {
-    "hi": _GREETING, "hello": _GREETING, "hey": _GREETING,
-    "ok": _ACK, "okay": _ACK, "got it": _ACK,
-    "thanks": _THANKS, "thank you": _THANKS, "tq": _THANKS,
+# Small phrase table: normalized phrase -> fixed reply. Keep entries lowercase,
+# single-spaced, no surrounding punctuation. Add variants here (not inline
+# logic) so the table stays the single source of truth.
+_CASUAL_PHRASES = {
+    # greetings
+    "hi": _GREETING, "hello": _GREETING, "hey": _GREETING, "hiya": _GREETING,
+    "hola": _GREETING, "howdy": _GREETING, "good morning": _GREETING,
+    "good afternoon": _GREETING, "good evening": _GREETING, "good day": _GREETING,
+    "namaste": _GREETING, "namaskar": _GREETING, "namaskaram": _GREETING,
+    # thanks
+    "thanks": _THANKS, "thank you": _THANKS, "thankyou": _THANKS,
+    "thank u": _THANKS, "thx": _THANKS, "ty": _THANKS, "tq": _THANKS,
+    "cheers": _THANKS, "appreciate it": _THANKS, "appreciated": _THANKS,
+    "thanks a lot": _THANKS, "thank you so much": _THANKS, "thank you very much": _THANKS,
+    # acknowledgements
+    "ok": _ACK, "okay": _ACK, "k": _ACK, "kk": _ACK, "okie": _ACK,
+    "got it": _ACK, "understood": _ACK, "noted": _ACK, "sure": _ACK,
+    "alright": _ACK, "all right": _ACK, "right": _ACK, "fine": _ACK,
+    "hmm": _ACK, "hm": _ACK, "aha": _ACK, "i see": _ACK, "makes sense": _ACK,
+    "ok thanks": _THANKS, "okay thanks": _THANKS, "ok thank you": _THANKS,
+    # compliments / reactions
+    "nice": _COMPLIMENT, "good": _COMPLIMENT, "great": _COMPLIMENT,
+    "awesome": _COMPLIMENT, "amazing": _COMPLIMENT, "perfect": _COMPLIMENT,
+    "excellent": _COMPLIMENT, "fantastic": _COMPLIMENT, "super": _COMPLIMENT,
+    "lovely": _COMPLIMENT, "beautiful": _COMPLIMENT, "well done": _COMPLIMENT,
+    "good job": _COMPLIMENT, "nice work": _COMPLIMENT, "great job": _COMPLIMENT,
+    "nice one": _COMPLIMENT, "wow": _COMPLIMENT, "cool": _COMPLIMENT,
+    # short conversational / taunts
+    "waste fellow": _REACT, "waste": _REACT, "lol": _REACT, "haha": _REACT,
+    "hehe": _REACT, "ok fine": _ACK, "hmm ok": _ACK,
+    # telugu-english (practical mixed phrases)
+    "thanks andi": _THANKS, "thank you andi": _THANKS,
+    "hi andi": _GREETING, "hello andi": _GREETING, "namaste andi": _GREETING,
+    "ok andi": _ACK, "okay andi": _ACK, "sare": _ACK, "sare andi": _ACK,
+    "super andi": _COMPLIMENT, "nice andi": _COMPLIMENT, "good andi": _COMPLIMENT,
+    "bagundhi": _COMPLIMENT, "chala bagundhi": _COMPLIMENT,
+    # telugu script (practical)
+    "నమస్కారం": _GREETING, "ధన్యవాదాలు": _THANKS, "సరే": _ACK,
+    "చాలా బాగుంది": _COMPLIMENT,
 }
 
-# The same phrases typed without their spaces — "thankyou" and "gotit" are as
-# common as "thank you" / "got it". Only a message that already IS one of the
-# short phrases can reach this table: a real question's space-free form still
-# contains its other words ("thankyouwhatistheparentall..."), so it never hits.
-_CASUAL_COMPACT = {k.replace(" ", ""): v for k, v in _CASUAL.items()}
+# Space-free variants ("thankyou", "gotit") are as common as the spaced forms.
+_CASUAL_COMPACT = {k.replace(" ", ""): v for k, v in _CASUAL_PHRASES.items() if " " in k}
+
+
+def _collapse_repeats(s: str) -> str:
+    # Collapse runs of 3+ identical letters to a single letter so common
+    # spelling variations ("thaaanks", "niiice", "okkkk") still match, while
+    # ordinary double letters ("good", "hello") are left untouched.
+    return re.sub(r"(.)\1{2,}", r"\1", s)
+
+
+def _normalize_casual(question) -> str:
+    q = re.sub(r"\s+", " ", str(question or "")).strip().lower()
+    q = q.strip("!?,.;:'\"()[]{}").strip()
+    return q
 
 
 def casual_reply(question) -> str | None:
     """Fixed reply for obvious conversational messages, else None.
 
-    Normalization is deliberately narrow: collapse runs of whitespace, fold
-    case, trim punctuation at both ends — then match the exact phrase or the
-    same phrase with its spaces removed ("thankyou", "gotit"). Anything longer
-    than a listed phrase — including "thank you, what is the parental leave
-    policy?" — returns None and flows to the graph.
+    Conservative: only a whole, short message that exactly matches a listed
+    phrase (after normalization, repeat-collapse, and space-removal) counts as
+    casual. Anything longer - including "thank you, what is the parental leave
+    policy?" - returns None and flows to the graph.
     """
-    q = re.sub(r"\s+", " ", str(question or "")).strip().lower()
-    q = q.strip("!?,.;:'\"()[]{}").strip()
+    q = _normalize_casual(question)
     if not q:
         return None
-    return _CASUAL.get(q) or _CASUAL_COMPACT.get(q.replace(" ", ""))
+    # Build a small set of normalized candidates and accept only an exact
+    # table hit. This tolerates spacing, punctuation/case, and character
+    # repeats ("thaaanks"), while a genuine question can never collapse
+    # onto a single short phrase.
+    candidates = {q, _collapse_repeats(q)}
+    compact = q.replace(" ", "")
+    candidates.add(compact)
+    candidates.add(_collapse_repeats(compact))
+    for cand in candidates:
+        reply = _CASUAL_PHRASES.get(cand)
+        if reply is not None:
+            return reply
+        reply = _CASUAL_COMPACT.get(cand)
+        if reply is not None:
+            return reply
+    return None
 
 
 def clean_markers(text: str) -> str:

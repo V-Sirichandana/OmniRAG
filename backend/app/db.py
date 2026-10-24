@@ -196,6 +196,17 @@ _MIGRATIONS = [
     # Work-email identity (Stage A): nullable, so legacy accounts keep their
     # username-only login; uniqueness comes from the partial index in init().
     ("users", "email", "TEXT"),
+    # Employment agreement tracking (additive, backward-compatible defaults).
+    ("users", "full_name", "TEXT"),
+    ("users", "employment_type", "TEXT NOT NULL DEFAULT 'full_time'"),
+    ("users", "agreement_start", "TEXT"),
+    ("users", "agreement_end", "TEXT"),
+    # Bulk onboarding metadata on invites (copied to the user on registration).
+    ("invites", "full_name", "TEXT"),
+    ("invites", "email", "TEXT"),
+    ("invites", "employment_type", "TEXT NOT NULL DEFAULT 'full_time'"),
+    ("invites", "agreement_start", "TEXT"),
+    ("invites", "agreement_end", "TEXT"),
 ]
 
 

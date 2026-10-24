@@ -82,6 +82,10 @@ export interface AdminUser {
   employee_id?: string | null;
   is_manager?: number | boolean;
   created: string;
+  full_name?: string | null;
+  employment_type?: string;
+  agreement_start?: string | null;
+  agreement_end?: string | null;
 }
 
 export interface Invite {

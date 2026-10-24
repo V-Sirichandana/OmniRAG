@@ -31,7 +31,8 @@ def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
     with db() as c:  # re-read each request so role changes / deletions apply immediately
         row = c.execute(
             "SELECT u.id,u.username,u.email,u.role,u.tenant_id,u.department,u.employee_id,"
-            "u.is_manager,t.name AS tenant_name "
+            "u.is_manager,u.full_name,u.employment_type,u.agreement_start,u.agreement_end,"
+            "t.name AS tenant_name "
             "FROM users u JOIN tenants t ON t.id=u.tenant_id WHERE u.id=?", (uid,)).fetchone()
     if not row: raise HTTPException(401, "User no longer exists")
     return dict(row)

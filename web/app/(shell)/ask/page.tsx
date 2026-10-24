@@ -16,6 +16,7 @@ import {
   AlertTriangle,
   BookOpenCheck,
   CornerDownLeft,
+  Loader2,
   Sparkles,
 } from "lucide-react";
 import { api, ApiError, errorToMessage } from "@/lib/api";
@@ -61,6 +62,7 @@ function AskPage() {
   const createdRef = useRef<string | null>(null);
   // mirrors `busy` for use in non-render callbacks (the conversation loader)
   const busyRef = useRef(false);
+  const submittingRef = useRef(false); // synchronous in-flight guard against double-submit
   const autoSentRef = useRef(false); // send ?q= exactly once (even under StrictMode)
 
   // provider status banner (LLM key presence)
@@ -109,6 +111,9 @@ function AskPage() {
 
   const send = useCallback(
     async (text?: string) => {
+      // Synchronous in-flight guard: prevents duplicate submissions from
+      // rapid double-clicks/Enter presses before React re-renders `busy`.
+      if (submittingRef.current) return;
       const q = (text ?? input).trim();
       if (!q || busy) return;
       // Enforce the API contract (question: 2..2000 chars) BEFORE any state is
@@ -117,6 +122,7 @@ function AskPage() {
         setError(q.length < MIN_Q ? TOO_SHORT_MSG : TOO_LONG_MSG);
         return;
       }
+      submittingRef.current = true;
       setError("");
       setInput("");
       setMessages((m) => [...m, { role: "user", content: q }]);
@@ -143,6 +149,7 @@ function AskPage() {
       } finally {
         setBusy(false);
         busyRef.current = false;
+        submittingRef.current = false;
       }
     },
     [busy, convId, input, language, router],
@@ -249,7 +256,7 @@ function AskPage() {
                     OmniRAG
                   </div>
                   <div className="rounded-2xl rounded-bl-md border border-line bg-white px-4 py-3.5 shadow-[0_1px_2px_rgba(15,23,42,.05)]">
-                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-slate-800">
+                    <p className="whitespace-pre-wrap break-words text-sm leading-relaxed text-slate-800">
                       {presentAssistantText(m.content)}
                     </p>
                   </div>
@@ -304,7 +311,16 @@ function AskPage() {
             disabled={busy || !input.trim()}
             className="flex h-[46px] items-center gap-2 rounded-xl bg-brand px-5 text-sm font-semibold text-white transition hover:bg-brand-2 disabled:opacity-40"
           >
-            Send <CornerDownLeft size={14} />
+            {busy ? (
+              <>
+                Sending
+                <Loader2 size={14} className="animate-spin" />
+              </>
+            ) : (
+              <>
+                Send <CornerDownLeft size={14} />
+              </>
+            )}
           </button>
         </form>
         <p className="mx-auto mt-2 max-w-4xl text-[10px] text-slate-500">

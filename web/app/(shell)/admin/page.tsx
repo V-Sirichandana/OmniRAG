@@ -9,11 +9,13 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ClipboardCopy,
   Crown,
+  Download,
   IdCard,
   KeyRound,
   ScrollText,
   ShieldCheck,
   Trash2,
+  UploadCloud,
   UserPlus,
   Users,
 } from "lucide-react";
@@ -46,6 +48,18 @@ const ACTION_TONES: Record<string, "emerald" | "indigo" | "amber" | "red" | "sla
   search: "indigo",
 };
 
+function agreementStatus(u: AdminUser): "Active" | "Expiring Soon" | "Expired" {
+  if (!u.agreement_end) return "Active";
+  const end = new Date(u.agreement_end);
+  if (isNaN(end.getTime())) return "Active";
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  if (end < today) return "Expired";
+  const soon = new Date(today);
+  soon.setDate(soon.getDate() + 30);
+  if (end <= soon) return "Expiring Soon";
+  return "Active";
+}
 export default function AdminPage() {
   const { user } = useAuth();
   const isAdmin = user?.role === "admin";
@@ -65,6 +79,34 @@ export default function AdminPage() {
   const [role, setRole] = useState<Role>("member");
   const [days, setDays] = useState(7);
   const [busy, setBusy] = useState(false);
+
+  // bulk onboarding (CSV)
+  const [csvFile, setCsvFile] = useState<File | null>(null);
+  const [csvBusy, setCsvBusy] = useState(false);
+  const [csvError, setCsvError] = useState("");
+  const [csvResult, setCsvResult] = useState<any>(null);
+
+  const downloadTemplate = () => {
+    window.location.href = "/api/admin/onboarding/template";
+  };
+
+  const importCsv = async () => {
+    if (!csvFile) return;
+    setCsvBusy(true);
+    setCsvError("");
+    setCsvResult(null);
+    try {
+      const fd = new FormData();
+      fd.append("file", csvFile);
+      const res = await api.upload<any>("/api/admin/onboarding/import", fd);
+      setCsvResult(res);
+      load();
+    } catch (e) {
+      setCsvError(e instanceof ApiError ? e.message : "Import failed");
+    } finally {
+      setCsvBusy(false);
+    }
+  };
 
   const load = useCallback(() => {
     if (!isAdmin) return;
@@ -101,7 +143,9 @@ export default function AdminPage() {
 
   async function patchUser(
     id: string,
-    body: { role?: Role; department?: string; is_manager?: boolean },
+    body: { role?: Role; department?: string; is_manager?: boolean;
+            employment_type?: string; agreement_start?: string | null; agreement_end?: string | null;
+            full_name?: string | null },
   ) {
     try {
       await api.patch(`/api/admin/users/${id}`, body);
@@ -206,6 +250,7 @@ export default function AdminPage() {
                 <th className="px-3 py-3 font-medium">Employee ID</th>
                 <th className="px-3 py-3 font-medium">Department</th>
                 <th className="px-3 py-3 font-medium">Role</th>
+                <th className="px-3 py-3 font-medium">Agreement</th>
                 <th className="px-3 py-3 font-medium">Manager</th>
                 <th className="px-3 py-3 font-medium">Joined</th>
                 <th className="px-3 py-3 text-right font-medium">Actions</th>
@@ -271,6 +316,30 @@ export default function AdminPage() {
                       <option value="member">Member</option>
                       <option value="admin">Admin</option>
                     </select>
+                  </td>
+                  <td className="px-3 py-3">
+                    <div className="flex flex-col gap-1">
+                      <Badge tone={agreementStatus(u) === "Expired" ? "red" : agreementStatus(u) === "Expiring Soon" ? "amber" : "emerald"}>
+                        {agreementStatus(u)}
+                      </Badge>
+                      <select
+                        value={u.employment_type ?? "full_time"}
+                        onChange={(e) => void patchUser(u.id, { employment_type: e.target.value })}
+                        className="rounded-md border border-line-2 bg-white px-2 py-1 text-[10px] text-slate-700 outline-none focus:border-brand-2"
+                      >
+                        <option value="full_time">Full-time</option>
+                        <option value="contract">Contract</option>
+                        <option value="intern">Intern</option>
+                        <option value="fixed_term">Fixed-term</option>
+                      </select>
+                      <input
+                        type="date"
+                        defaultValue={u.agreement_end ?? ""}
+                        onBlur={(e) => void patchUser(u.id, { agreement_end: e.target.value || null })}
+                        className="rounded-md border border-line-2 bg-white px-2 py-1 text-[10px] text-slate-700 outline-none focus:border-brand-2"
+                        title="Agreement end date"
+                      />
+                    </div>
                   </td>
                   <td className="px-3 py-3">
                     <button
@@ -429,6 +498,58 @@ export default function AdminPage() {
       </div>
 
       {/* audit trail */}
+      {/* bulk onboarding */}
+      <Panel icon={UploadCloud} title="Bulk Employee Onboarding (CSV)" subtitle="Issue employee IDs from a spreadsheet">
+        <div className="space-y-4">
+          <div className="flex flex-wrap items-center gap-3">
+            <Btn variant="secondary" onClick={downloadTemplate}>
+              <Download size={15} /> Download template
+            </Btn>
+            <input
+              type="file"
+              accept=".csv,text/csv"
+              onChange={(e) => setCsvFile(e.target.files?.[0] ?? null)}
+              className="text-sm text-slate-600"
+            />
+            <Btn onClick={() => void importCsv()} loading={csvBusy} disabled={!csvFile}>
+              <UploadCloud size={15} /> Import
+            </Btn>
+          </div>
+          <ErrorNote>{csvError}</ErrorNote>
+          {csvResult && (
+            <div className="space-y-2 text-xs">
+              <p className="text-slate-600">
+                Total {csvResult.summary?.total ?? 0} · Created {csvResult.summary?.created ?? 0} ·
+                Valid {csvResult.summary?.valid ?? 0} · Invalid {csvResult.summary?.invalid ?? 0} ·
+                Duplicate {csvResult.summary?.duplicate ?? 0} · Existing {csvResult.summary?.existing ?? 0}
+              </p>
+              <div className="max-h-48 overflow-y-auto rounded-lg border border-line">
+                <table className="w-full text-left text-xs">
+                  <thead className="sticky top-0 bg-panel-2 text-[10px] uppercase tracking-wide text-slate-500">
+                    <tr>
+                      <th className="px-3 py-2">Row</th>
+                      <th className="px-3 py-2">Status</th>
+                      <th className="px-3 py-2">Employee ID</th>
+                      <th className="px-3 py-2">Errors</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-line">
+                    {(csvResult.rows ?? []).map((r: any) => (
+                      <tr key={r.row}>
+                        <td className="px-3 py-2">{r.row}</td>
+                        <td className="px-3 py-2">{r.status}</td>
+                        <td className="px-3 py-2 font-mono">{r.code || r.employee_id || "—"}</td>
+                        <td className="px-3 py-2 text-red-600">{(r.errors ?? []).join("; ")}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      </Panel>
+
       <Panel icon={ScrollText} title="Audit Trail" subtitle="Last 100 security-relevant events" bodyClassName="p-0">
         <div className="max-h-96 overflow-y-auto">
           <table className="w-full min-w-[560px] text-left text-sm">
