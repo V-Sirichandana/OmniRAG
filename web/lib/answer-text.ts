@@ -17,10 +17,16 @@ export function isAbstention(text: string): boolean {
   return t.includes("couldn't find this") || t.includes("don't contain enough support");
 }
 
-/** Shown in place of the pipeline's abstention wording — no internal detail. */
+/**
+ * Shown in place of the pipeline's abstention wording — no internal detail.
+ * Friendly and actionable: says why (not enough support in the documents the
+ * employee can access), that we won't guess, and what to try next.
+ */
 export const ABSTENTION_NOTICE =
-  "I couldn't find enough information in the documents you can access to answer " +
-  "that reliably. Please try a more specific question or contact your administrator.";
+  "I couldn't find enough in the documents you can access to answer that " +
+  "reliably, so I'd rather not guess. Try a more specific question — a key " +
+  "phrase or a document name often helps — or contact your administrator if " +
+  "you think a relevant document should be shared with you.";
 
 /** Text rendered for an assistant turn: friendly notice on abstention, else as-is. */
 export function presentAssistantText(text: string): string {

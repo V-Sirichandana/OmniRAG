@@ -39,8 +39,10 @@ test("abstention markers render the concise friendly notice", () => {
 test("the notice is the approved copy and leaks no pipeline wording", () => {
   assert.equal(
     ABSTENTION_NOTICE,
-    "I couldn't find enough information in the documents you can access to answer " +
-      "that reliably. Please try a more specific question or contact your administrator.",
+    "I couldn't find enough in the documents you can access to answer that " +
+      "reliably, so I'd rather not guess. Try a more specific question — a key " +
+      "phrase or a document name often helps — or contact your administrator if " +
+      "you think a relevant document should be shared with you.",
   );
   const lower = ABSTENTION_NOTICE.toLowerCase();
   for (const internal of [
@@ -53,6 +55,10 @@ test("the notice is the approved copy and leaks no pipeline wording", () => {
   ]) {
     assert.ok(!lower.includes(internal), `notice must not mention ${internal}`);
   }
+  // friendly + clear: explains why, declines to guess, and says what to try next
+  assert.ok(ABSTENTION_NOTICE.includes("I'd rather not guess"));
+  assert.ok(ABSTENTION_NOTICE.includes("Try a more specific question"));
+  assert.ok(ABSTENTION_NOTICE.includes("contact your administrator"));
 });
 
 test("real answers and casual replies pass through unchanged", () => {

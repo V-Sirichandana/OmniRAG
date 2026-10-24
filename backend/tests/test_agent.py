@@ -664,6 +664,8 @@ def test_casual_gate_normalizes_but_matches_only_exact_phrases():
     assert A.casual_reply("thank you") == CASUAL_THANKS
     # Real document questions — including thanks/hi-prefixed ones — never match.
     for q in ("Thank you, what is the leave policy?",
+              "thank you, what is the parental leave policy?",
+              "thankyou, what is the parental leave policy?",
               "What is the parental leave policy?",
               "Does the company offer paternity leave?",
               "hi, how many paid vacation days do we get?",
@@ -671,6 +673,33 @@ def test_casual_gate_normalizes_but_matches_only_exact_phrases():
               "thanks — how many approvals do deployments need?",
               VAC_Q, DEPLOY_Q, "hi there", "tqvm", ""):
         assert A.casual_reply(q) is None, f"must not treat as casual: {q!r}"
+
+
+@test
+def test_casual_gate_matches_unspaced_and_punctuation_variants():
+    from app import agent as A
+    # spacing/case/punctuation variations of the SAME phrases
+    for q in ("thankyou", "THANKYOU", "ThankYou", "thank   you", "THANK YOU!",
+              " thanks,", "(thanks)", "Thanks."):
+        assert A.casual_reply(q) == CASUAL_THANKS, (q, A.casual_reply(q))
+    for q in ("gotit", "Got It", "got it.", "HI", "hi!", "TQ", "okay", "ok:"):
+        assert A.casual_reply(q) is not None, q
+    # …but a question that merely starts with thanks keeps its extra words
+    for q in ("thank you, what is the parental leave policy?",
+              "thankyou what is the parental leave policy",
+              "thanks for the help — how many approvals do deployments need?"):
+        assert A.casual_reply(q) is None, f"must not treat as casual: {q!r}"
+
+
+@test
+def test_unspaced_thanks_skips_retrieval_and_the_model():
+    _reset_llm()
+    calls_before = len(CALLS)
+    r = _run_as("hr_member", "  THANKYOU!  ")
+    assert r["answer"] == CASUAL_THANKS, r["answer"]
+    assert r["abstained"] is False
+    assert r["evidence"] == [] and r["providers"] == ""
+    assert len(CALLS) == calls_before, "an LLM call was issued for 'thankyou'"
 
 
 @test

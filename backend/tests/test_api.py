@@ -1410,6 +1410,31 @@ def test_thanks_prefixed_document_question_still_goes_through_rag():
     assert "key" in r.json()["detail"].lower()
 
 
+@test
+def test_unspaced_and_spaced_thanks_both_reply_without_rag():
+    t = auth(STATE["acme"]["token"])
+    # No LLM key is configured here: a 200 proves these short-circuited before
+    # retrieval/generation/verification — including the unspaced "thankyou".
+    for q in ("thankyou", "thank you", "THANK YOU!", "  thanks  ", "gotit", "TQ"):
+        r = client.post("/api/chat", headers=t, json={"question": q})
+        assert r.status_code == 200, (q, r.status_code, r.text)
+        ans = r.json()["answer"]
+        assert ("You're welcome" in ans) or ("Understood" in ans) or ("Hello!" in ans), (q, ans)
+        assert "couldn't find" not in ans.lower(), (q, ans)
+
+
+@test
+def test_thankyou_prefix_does_not_swallow_a_document_question():
+    t = auth(STATE["acme"]["token"])
+    # Both spellings of a thanks-prefixed policy question must still go
+    # through authorized retrieval (503 = the real RAG path without an LLM key).
+    for q in ("thank you, what is the parental leave policy?",
+              "thankyou, what is the parental leave policy?"):
+        r = client.post("/api/chat", headers=t, json={"question": q})
+        assert r.status_code == 503, (q, r.status_code, r.text)
+        assert "key" in r.json()["detail"].lower()
+
+
 # --- Stability pass: destructive ordering, races, scope guard, language ------
 
 @test

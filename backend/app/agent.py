@@ -59,16 +59,27 @@ _CASUAL = {
     "thanks": _THANKS, "thank you": _THANKS, "tq": _THANKS,
 }
 
+# The same phrases typed without their spaces — "thankyou" and "gotit" are as
+# common as "thank you" / "got it". Only a message that already IS one of the
+# short phrases can reach this table: a real question's space-free form still
+# contains its other words ("thankyouwhatistheparentall..."), so it never hits.
+_CASUAL_COMPACT = {k.replace(" ", ""): v for k, v in _CASUAL.items()}
+
 
 def casual_reply(question) -> str | None:
     """Fixed reply for obvious conversational messages, else None.
 
-    Normalization is whitespace collapse + case fold + trailing-punctuation
-    strip only. Anything longer than the listed phrases — including a
-    thanks-prefixed document question — returns None and flows to the graph.
+    Normalization is deliberately narrow: collapse runs of whitespace, fold
+    case, trim punctuation at both ends — then match the exact phrase or the
+    same phrase with its spaces removed ("thankyou", "gotit"). Anything longer
+    than a listed phrase — including "thank you, what is the parental leave
+    policy?" — returns None and flows to the graph.
     """
-    q = re.sub(r"\s+", " ", str(question or "")).strip().lower().rstrip("!?.;:").strip()
-    return _CASUAL.get(q)
+    q = re.sub(r"\s+", " ", str(question or "")).strip().lower()
+    q = q.strip("!?,.;:'\"()[]{}").strip()
+    if not q:
+        return None
+    return _CASUAL.get(q) or _CASUAL_COMPACT.get(q.replace(" ", ""))
 
 
 def clean_markers(text: str) -> str:

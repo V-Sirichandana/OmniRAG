@@ -45,12 +45,47 @@ test("chat: failed send restores the typed question", () => {
 });
 
 test("chat: length limits are enforced client-side before any state change", () => {
-  assert.ok(ask.includes("q.length < 2 || q.length > 2000"), "2..2000 contract check");
+  assert.ok(ask.includes("q.length < MIN_Q || q.length > MAX_Q"), "2..2000 contract check");
   assert.ok(
-    ask.indexOf("q.length < 2 || q.length > 2000") < ask.indexOf('setInput("");'),
+    ask.indexOf("q.length < MIN_Q || q.length > MAX_Q") < ask.indexOf('setInput("");'),
     "the check must run before the composer is cleared",
   );
   assert.ok(ask.includes("Please type at least 2 characters."), "clear one-char message");
+});
+
+test("chat: length warning clears as soon as the user types again", () => {
+  assert.ok(
+    ask.includes('if (error === TOO_SHORT_MSG || error === TOO_LONG_MSG) setError("");'),
+    "onChange must dismiss the length warning once editing resumes",
+  );
+  assert.ok(
+    ask.indexOf("setInput(e.target.value);") <
+      ask.indexOf('if (error === TOO_SHORT_MSG || error === TOO_LONG_MSG) setError("");'),
+    "the clear happens in the composer's onChange",
+  );
+  assert.ok(
+    !ask.includes('onChange={(e) => { setInput(e.target.value); setError(""); }}'),
+    "onChange must not blanket-clear every error",
+  );
+});
+
+test("chat: layout fills main exactly and only the list scrolls", () => {
+  assert.ok(
+    ask.includes('className="flex h-full flex-col overflow-hidden"'),
+    "root fills <main> (no hardcoded 100vh-4rem that overflows)",
+  );
+  assert.ok(
+    !ask.includes("calc(100vh-4rem)") && !ask.includes("calc(100dvh-4rem)"),
+    "no leftover viewport math that mis-measures the topbar",
+  );
+  assert.ok(
+    ask.includes('className="min-h-0 flex-1 overflow-y-auto px-4 py-6 sm:px-8"'),
+    "message list is the flex-1 scroll container",
+  );
+  assert.ok(
+    ask.includes("min-w-0 flex-1") || ask.includes('flex h-full flex-col overflow-hidden'),
+    "root is a flex column so the composer stays pinned at the bottom",
+  );
 });
 
 test("chat: switching conversations clears a stale error banner", () => {

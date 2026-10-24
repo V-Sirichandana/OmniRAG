@@ -29,6 +29,12 @@ const LANGUAGES = ["English", "Español", "Français", "हिन्दी"];
 /** Composer grows up to this height (matches `max-h-40`) before scrolling. */
 const COMPOSER_MAX_PX = 160;
 
+/** API contract for one chat question (mirrors the backend's validation). */
+const MIN_Q = 2;
+const MAX_Q = 2000;
+const TOO_SHORT_MSG = "Please type at least 2 characters.";
+const TOO_LONG_MSG = `That message is too long — please keep it under ${MAX_Q} characters.`;
+
 const SUGGESTIONS = [
   "What is the parental leave policy?",
   "Summarize the deployment security standard.",
@@ -107,12 +113,8 @@ function AskPage() {
       if (!q || busy) return;
       // Enforce the API contract (question: 2..2000 chars) BEFORE any state is
       // touched, so an over/under-length message never erases the composer.
-      if (q.length < 2 || q.length > 2000) {
-        setError(
-          q.length < 2
-            ? "Please type at least 2 characters."
-            : "That message is too long — please keep it under 2000 characters.",
-        );
+      if (q.length < MIN_Q || q.length > MAX_Q) {
+        setError(q.length < MIN_Q ? TOO_SHORT_MSG : TOO_LONG_MSG);
         return;
       }
       setError("");
@@ -158,7 +160,11 @@ function AskPage() {
   const noLlm = providers !== null && providers.llm.length === 0;
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] flex-col overflow-hidden">
+    // `h-full` fills the shell's <main> exactly. Hardcoded viewport math
+    // mis-measures the topbar, overflows <main> and yields blank space plus
+    // whole-page scroll. Here only the message list scrolls; the composer
+    // stays pinned to the bottom.
+    <div className="flex h-full flex-col overflow-hidden">
       {/* header */}
       <div className="border-b border-line bg-white px-5 py-4 sm:px-8">
         <div className="mx-auto flex max-w-4xl flex-wrap items-end justify-between gap-3">
@@ -277,7 +283,12 @@ function AskPage() {
             ref={composerRef}
             rows={1}
             value={input}
-            onChange={(e) => setInput(e.target.value)}
+            onChange={(e) => {
+              setInput(e.target.value);
+              // a length warning clears as soon as the user types again —
+              // real request errors (from send/loads) stay until a retry
+              if (error === TOO_SHORT_MSG || error === TOO_LONG_MSG) setError("");
+            }}
             onKeyDown={(e) => {
               // !isComposing: IME users commit a composition with Enter
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
