@@ -19,7 +19,7 @@ import {
   UserPlus,
   Users,
 } from "lucide-react";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, getToken, API_BASE } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { AdminUser, AuditEntry, Department, Invite, Role, Stats } from "@/lib/types";
 import { Badge, Btn, ErrorNote, Field, PageHeader, Panel, formatDate, inputCls } from "@/components/ui";
@@ -86,8 +86,41 @@ export default function AdminPage() {
   const [csvError, setCsvError] = useState("");
   const [csvResult, setCsvResult] = useState<any>(null);
 
-  const downloadTemplate = () => {
-    window.location.href = "/api/admin/onboarding/template";
+  const downloadTemplate = async () => {
+    const token = getToken();
+    if (!token) {
+      setError("Session expired \u2014 please sign in again.");
+      return;
+    }
+    setCsvError("");
+    try {
+      const res = await fetch(`${API_BASE}/api/admin/onboarding/template`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        let msg = `Request failed (${res.status})`;
+        try {
+          const d = await res.json();
+          if (d && typeof d.detail === "string") msg = d.detail;
+        } catch {
+          // non-JSON body; keep status-line message
+        }
+        throw new ApiError(msg, res.status);
+      }
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "employee_onboarding_template.csv";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      // Defer revocation so the browser has time to start the download;
+      // revoking synchronously can cancel the download in some browsers.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : "Download failed");
+    }
   };
 
   const importCsv = async () => {

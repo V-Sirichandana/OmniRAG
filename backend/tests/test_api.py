@@ -1656,6 +1656,23 @@ def test_existing_user_defaults_for_agreement_fields():
         # employment_type should be populated (default applied)
         assert u.get("employment_type") is not None, u
 
+@test
+def test_csv_template_download_authenticated_admin():
+    t = auth(STATE["acme"]["token"])
+    r = client.get("/api/admin/onboarding/template", headers=t)
+    assert r.status_code == 200, r.text
+    assert "text/csv" in r.headers.get("content-type", "")
+    assert "employee_id" in r.text
+    assert "department" in r.text
+
+
+@test
+def test_csv_template_download_unauthenticated_rejected():
+    r = client.get("/api/admin/onboarding/template")
+    assert r.status_code == 401, r.status_code
+
+
+
 
 def main():
     failed = 0
