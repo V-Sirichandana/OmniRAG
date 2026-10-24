@@ -27,7 +27,10 @@ export default function DepartmentsPage() {
   const load = useCallback(() => {
     api
       .get<Department[]>("/api/departments")
-      .then(setDepts)
+      .then((d) => {
+        setDepts(d);
+        setError(""); // a successful reload clears any earlier failure banner
+      })
       .catch((e) => setError(e instanceof ApiError ? e.message : "Failed to load"))
       .finally(() => setLoading(false));
   }, []);

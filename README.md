@@ -97,7 +97,7 @@ browser ──► Next.js (web/)  ──/api rewrite──►  FastAPI (backend/
 │   │   ├── agent.py      # LangGraph planner/retriever/answerer/verifier
 │   │   ├── llm.py        # provider failover
 │   │   └── config.py     # env-driven configuration
-│   ├── tests/test_api.py # 37 end-to-end API checks (no network needed)
+│   ├── tests/test_api.py # 59 end-to-end API checks (no network needed)
 │   ├── requirements.txt
 │   └── .env.example      # copy to .env and fill in
 └── legacy/               # original Vite prototype (superseded, kept for reference)
@@ -165,7 +165,7 @@ Run the API test suite (isolated temp DB, no network, no keys needed):
 
 ```powershell
 cd backend
-python tests/test_api.py        # 37/37: auth, tenant isolation, ACL, retrieval, admin…
+python tests/test_api.py        # 59/59: auth, tenant isolation, ACL, retrieval, admin…
 ```
 
 ## Deploying to Vercel
@@ -232,7 +232,7 @@ python tests/test_api.py        # 37/37: auth, tenant isolation, ACL, retrieval,
 | Search | `POST /api/search` (retrieval with citations, no LLM) |
 | Admin | `GET /api/admin/stats` (incl. `storage` bytes), `GET /api/admin/users`, `PATCH/DELETE /api/admin/users/{id}` (role, department, `is_manager`, work `email`), `POST/GET /api/admin/invites`, `GET /api/admin/audit` |
 | Team | `GET /api/team/overview` (department docs/members for designated managers only — 403 otherwise) |
-| Meta | `GET /api/health`, `GET /api/providers`, `GET /api/docs` |
+| Meta | `GET /api/health`, `GET /api/providers` (the interactive OpenAPI UI is served at `/docs` by a locally running API — it is not exposed on the deployed site) |
 
 ## Known limits
 

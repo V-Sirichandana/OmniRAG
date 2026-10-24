@@ -74,7 +74,7 @@ const VISIBILITY_RULES: {
 ];
 
 export default function SettingsPage() {
-  const { user } = useAuth();
+  const { user, logout } = useAuth();
   const router = useRouter();
   const isAdmin = user?.role === "admin";
   const initialTab: Tab = isAdmin ? "company" : "profile";
@@ -209,7 +209,7 @@ export default function SettingsPage() {
               <Btn variant="secondary" onClick={() => router.push("/ask")}>
                 Ask OmniRAG
               </Btn>
-              <Btn variant="danger" onClick={() => router.push("/login")}>
+              <Btn variant="danger" onClick={logout}>
                 <KeyRound size={15} /> Sign in from another device
               </Btn>
             </div>

@@ -5,7 +5,7 @@ All endpoints are tenant-scoped: every query filters by the caller's
 organization's documents, conversations or users. Department visibility is
 enforced here (server-side), never only in the UI.
 """
-import json, mimetypes, os, random, string, time
+import json, mimetypes, os, secrets, string, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
@@ -177,17 +177,30 @@ def signup_org(b: OrgSignup):
 def register(b: Register):
     """Join an existing organization with a company-issued Employee ID."""
     name, uid = _norm_username(b.username), D.uid()
-    with D.db() as c:
-        inv = c.execute("SELECT * FROM invites WHERE code=?", (b.invite_code.strip(),)).fetchone()
-        if not inv or inv["used_by"] or inv["expires"] < datetime.now(timezone.utc).isoformat():
-            raise HTTPException(400, "Employee ID is invalid or expired")
-        if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
-            raise HTTPException(409, "Username already taken")
-        dept = inv["department"] or "General"
-        c.execute(
-            "INSERT INTO users(id,username,pw_hash,tenant_id,role,department,employee_id) VALUES(?,?,?,?,?,?,?)",
-            (uid, name, S.hash_pw(b.password), inv["tenant_id"], inv["role"], dept, inv["code"]))
-        c.execute("UPDATE invites SET used_by=? WHERE code=?", (uid, b.invite_code.strip()))
+    code = b.invite_code.strip()
+    try:
+        with D.db() as c:
+            inv = c.execute("SELECT * FROM invites WHERE code=?", (code,)).fetchone()
+            if not inv or inv["used_by"] or inv["expires"] < datetime.now(timezone.utc).isoformat():
+                raise HTTPException(400, "Employee ID is invalid or expired")
+            if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                raise HTTPException(409, "Username already taken")
+            dept = inv["department"] or "General"
+            # Claim the code first: the UPDATE only succeeds while it is still
+            # unused, so one Employee ID can never create two accounts even
+            # under concurrent registrations (raising here rolls the claim back).
+            if c.execute("UPDATE invites SET used_by=? WHERE code=? AND used_by IS NULL",
+                         (uid, code)).rowcount != 1:
+                raise HTTPException(400, "Employee ID is invalid or expired")
+            c.execute(
+                "INSERT INTO users(id,username,pw_hash,tenant_id,role,department,employee_id) VALUES(?,?,?,?,?,?,?)",
+                (uid, name, S.hash_pw(b.password), inv["tenant_id"], inv["role"], dept, code))
+    except D.IntegrityError:
+        # Lost a uniqueness race on username: classify as 409, never a raw 500.
+        with D.db() as c:
+            if c.execute("SELECT 1 FROM users WHERE username=?", (name,)).fetchone():
+                raise HTTPException(409, "Username already taken")
+        raise
     D.audit(inv["tenant_id"], uid, "user_joined", f"{name} ({dept})")
     return _session(uid)
 
@@ -266,8 +279,12 @@ def download_doc(doc_id: str, u=Depends(S.current_user)):
     D.audit(u["tenant_id"], u["id"], "doc_downloaded", r["filename"])
     data = bytes(r["content"])
     media = mimetypes.guess_type(r["filename"])[0] or "application/octet-stream"
+    # stored filenames are user-supplied: quotes/CRLF would corrupt (or inject
+    # into) the header, so neutralize them before building the response
+    safe = (r["filename"].replace('"', "_").replace("\r", "").replace("\n", "").strip()
+            or "download")
     return Response(data, media_type=media, headers={
-        "Content-Disposition": f'attachment; filename="{r["filename"]}"'})
+        "Content-Disposition": f'attachment; filename="{safe}"'})
 
 
 def _resolve_acl_users(c, tenant_id, user_ids):
@@ -286,14 +303,20 @@ def _set_acl(c, doc_id, tenant_id, user_ids):
         c.execute("INSERT INTO doc_acl(doc_id,user_id) VALUES(?,?)", (doc_id, uid))
 
 
-def _set_doc_departments(c, doc_id, tenant_id, dept_ids):
-    """Persist selected-department targets; every id must be a real department
-    of the caller's own organization."""
-    c.execute("DELETE FROM doc_departments WHERE doc_id=?", (doc_id,))
+def _assert_dept_targets(c, tenant_id, dept_ids):
+    """Every id must be a real department of the caller's organization (400)."""
     for did in dept_ids:
         if not c.execute("SELECT 1 FROM departments WHERE id=? AND tenant_id=?",
                          (did, tenant_id)).fetchone():
             raise HTTPException(400, "Unknown department (must belong to your organization)")
+
+
+def _set_doc_departments(c, doc_id, tenant_id, dept_ids):
+    """Persist selected-department targets; every id must be a real department
+    of the caller's own organization."""
+    c.execute("DELETE FROM doc_departments WHERE doc_id=?", (doc_id,))
+    _assert_dept_targets(c, tenant_id, dept_ids)
+    for did in dept_ids:
         c.execute("INSERT INTO doc_departments(doc_id,dept_id) VALUES(?,?)", (doc_id, did))
 
 
@@ -332,15 +355,20 @@ async def upload(
         department = ""
     else:
         department = department.strip() or (u.get("department") or "").strip() or "General"
-    data = await file.read()
+    # Validate every ACL/department target BEFORE ingesting or replacing
+    # anything: an unknown user/department must never cost the previous version
+    # of the file or leave a half-ingested document behind.
+    with D.db() as c:
+        if visibility == "restricted":
+            _resolve_acl_users(c, u["tenant_id"],
+                               [x for x in allowed_user_ids.split(",") if x])
+        if visibility == "selected_departments":
+            _assert_dept_targets(c, u["tenant_id"], [x.strip() for x in dept_ids])
+    # Read at most one byte past the limit so an oversized upload is rejected
+    # with 413 BEFORE the whole body is buffered in memory.
+    data = await file.read(MAX_UPLOAD_MB * 1024 * 1024 + 1)
     if len(data) > MAX_UPLOAD_MB * 1024 * 1024:
         raise HTTPException(413, f"File exceeds {MAX_UPLOAD_MB} MB")
-
-    with D.db() as c:  # re-uploading the same filename replaces it (no duplicates)
-        for old in c.execute("SELECT id FROM documents WHERE tenant_id=? AND filename=?",
-                             (u["tenant_id"], name)).fetchall():
-            rag.delete_doc(u["tenant_id"], old["id"])
-            c.execute("DELETE FROM documents WHERE id=?", (old["id"],))
 
     doc_id = D.uid()
     # Stage the document row first: chunks reference documents(id) via foreign
@@ -375,6 +403,16 @@ async def upload(
                      [x for x in allowed_user_ids.split(",") if x])
         if visibility == "selected_departments":
             _set_doc_departments(c, doc_id, u["tenant_id"], [x.strip() for x in dept_ids])
+    # Replacing a same-name predecessor is the LAST step — the new version is
+    # fully ingested and its ACL is set by now, so a rejected upload
+    # (extraction, validation, size) can never destroy the file it replaces.
+    with D.db() as c:
+        for old in c.execute("SELECT id FROM documents WHERE tenant_id=? AND filename=?",
+                             (u["tenant_id"], name)).fetchall():
+            if old["id"] == doc_id:
+                continue
+            rag.delete_doc(u["tenant_id"], old["id"])
+            c.execute("DELETE FROM documents WHERE id=?", (old["id"],))
     D.audit(u["tenant_id"], u["id"], "doc_uploaded",
             f"{name} ({visibility}{':' + department if department else ''})")
     return {"id": doc_id, "filename": name, "chunks": n, "visibility": visibility,
@@ -404,6 +442,19 @@ def set_access(doc_id: str, b: Acl, u=Depends(S.admin_user)):
     if doc_id not in authz.visible_doc_ids(u):
         raise HTTPException(404, "Document not found")
     with D.db() as c:
+        cur = c.execute("SELECT department FROM documents WHERE id=?", (doc_id,)).fetchone()
+        dept = (cur["department"] if cur else "") or ""
+        if visibility == "department":
+            # Members only ever see documents whose stored department matches
+            # theirs (authz.py). A document uploaded organization-wide stores
+            # no department, so applying "department" scope here would report
+            # ok while hiding it from every member — reject instead.
+            if not dept:
+                raise HTTPException(400, "This document has no department; upload it with a "
+                                        "department before scoping it to one")
+            if not c.execute("SELECT 1 FROM departments WHERE name=? AND tenant_id=?",
+                             (dept, u["tenant_id"])).fetchone():
+                raise HTTPException(400, f"Department '{dept}' no longer exists; pick another scope")
         c.execute("UPDATE documents SET visibility=?, download_allowed=? WHERE id=?",
                   (visibility, 1 if b.download_allowed else 0, doc_id))
         _set_acl(c, doc_id, u["tenant_id"], b.allowed_user_ids if visibility == "restricted" else [])
@@ -464,8 +515,12 @@ def create_department(b: DeptIn, u=Depends(S.admin_user)):
                      (u["tenant_id"], name)).fetchone():
             raise HTTPException(409, "Department already exists")
         did = D.uid()
-        c.execute("INSERT INTO departments(id,tenant_id,name,code) VALUES(?,?,?,?)",
-                  (did, u["tenant_id"], name, (b.code.strip() or name[:3].upper())))
+        try:
+            c.execute("INSERT INTO departments(id,tenant_id,name,code) VALUES(?,?,?,?)",
+                      (did, u["tenant_id"], name, (b.code.strip() or name[:3].upper())))
+        except D.IntegrityError:
+            # lost a uniqueness race on (tenant_id, name) — 409, never a 500
+            raise HTTPException(409, "Department already exists")
     D.audit(u["tenant_id"], u["id"], "dept_created", name)
     return {"id": did, "name": name}
 
@@ -512,11 +567,15 @@ def chat(b: Ask, u=Depends(S.current_user)):
 
     t0 = time.time()
     lang = b.language or "English"
-    query_text = f"{b.question} (Answer strictly in {lang})" if lang != "English" else b.question
 
     try:
-        # doc_ids is computed per request → tenant/scope isolation inside retrieval
-        res = agent.run(query_text, u["tenant_id"], authz.visible_doc_ids(u), hist, b.provider)
+        # doc_ids is computed per request → tenant/scope isolation inside retrieval.
+        # The language instruction is deliberately NOT appended to the question:
+        # it would pollute BM25 ranking, the sufficiency-gate term set and the
+        # casual-reply gate ("hi (Answer strictly in Spanish)" is not a
+        # greeting). agent.run adds it to the generation prompt only.
+        res = agent.run(b.question, u["tenant_id"], authz.visible_doc_ids(u), hist, b.provider,
+                        language=lang)
     except RuntimeError as e:
         raise HTTPException(503, str(e))
 
@@ -779,10 +838,16 @@ def make_invite(b: Invite, u=Depends(S.admin_user)):
                 raise HTTPException(409, "Employee ID already exists")
         else:
             prefix = DEPT_PREFIXES.get(dept, "EMP")
-            code = f"{prefix}-{''.join(random.choices(string.digits, k=6))}"
+            # secrets, not random: invite codes are bearer credentials for
+            # joining the organization and must not be predictable
+            code = f"{prefix}-{''.join(secrets.choice(string.digits) for _ in range(6))}"
         exp = (datetime.now(timezone.utc) + timedelta(days=b.days)).isoformat()
-        c.execute("INSERT INTO invites(code,tenant_id,role,department,created_by,expires) VALUES(?,?,?,?,?,?)",
-                  (code, u["tenant_id"], role, dept, u["id"], exp))
+        try:
+            c.execute("INSERT INTO invites(code,tenant_id,role,department,created_by,expires) VALUES(?,?,?,?,?,?)",
+                      (code, u["tenant_id"], role, dept, u["id"], exp))
+        except D.IntegrityError:
+            # lost a code-collision race (custom or generated code) — 409, never a 500
+            raise HTTPException(409, "Employee ID already exists")
     D.audit(u["tenant_id"], u["id"], "invite_created", f"{code} ({dept})")
     return {"code": code, "expires": exp, "department": dept, "role": role}
 

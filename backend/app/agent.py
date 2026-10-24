@@ -38,8 +38,11 @@ SYS = ("You are an enterprise knowledge assistant. Answer ONLY from the numbered
        "context is only for you to ground the answer. If the context does not contain the answer, say "
        "so plainly. Never invent facts. " + UNTRUSTED)
 
-# citation/reference markers some models emit anyway (e.g. [1] or 【5†p.3】)
-_CITE = re.compile(r"(?:\s*【\d+†[^】]*】)+|(?:\s*\[\d+\])+")
+# citation/reference markers some models emit anyway (e.g. [1] or 【5†p.3】).
+# The bracketed form is deliberately restricted to 1-2 digits without a leading
+# zero: models emit source numbers from the prompt's own [1]..[n] list, while
+# legitimate bracketed numbers in answers ("[2024]", "[401]") must survive.
+_CITE = re.compile(r"(?:\s*【\d+†[^】]*】)+|(?:\s*\[[1-9]\d?\])+")
 
 # ── Conversational intent gate ──────────────────────────────────────────────
 # Deterministic and deliberately NARROW: only an exact match of the normalized
@@ -79,7 +82,7 @@ class S(TypedDict, total=False):
     question: str; history: list; tenant_id: str; doc_ids: list; provider: str
     queries: list; hits: list; answer: str; grounded: bool; score: int; unsupported: list
     retries: int; used: list; trace: list; sufficiency: dict; abstained: bool
-    abstain_reason: str
+    abstain_reason: str; language: str
 
 def _log(s, msg): return s.get("trace", []) + [msg]
 def _json(text):
@@ -221,7 +224,14 @@ def answer(s: S):
     src = "\n\n".join(f"[{i+1}] ({h['meta']['filename']}, p.{h['meta']['page']})\n{h['text']}" for i, h in enumerate(s["hits"]))
     hist = "\n".join(f"{m['role']}: {m['content'][:300]}" for m in s.get("history", [])[-4:])
     extra = f"\nA previous draft contained unsupported claims: {s['unsupported']}. Remove them; use only what the sources state." if s.get("unsupported") else ""
-    t, p = llm.complete(SYS + extra, f"Conversation so far:\n{hist}\n\nSources:\n{src}\n\nQuestion: {s['question']}", s.get("provider"), 0.1)
+    # The answer-language instruction belongs to the GENERATION prompt only.
+    # Keeping it out of s["question"] means retrieval ranking, the sufficiency
+    # gate and the casual-reply gate all see the user's raw question.
+    q = s["question"]
+    lang = s.get("language") or "English"
+    if lang != "English":
+        q = f"{q} (Answer strictly in {lang})"
+    t, p = llm.complete(SYS + extra, f"Conversation so far:\n{hist}\n\nSources:\n{src}\n\nQuestion: {q}", s.get("provider"), 0.1)
     return {"answer": t.strip(), "used": s.get("used", []) + [p], "trace": _log(s, f"answer: drafted via {p}")}
 
 def verify(s: S):
@@ -299,7 +309,7 @@ def _result(out: dict) -> dict:
         "trace": out.get("trace", []),
     }
 
-def run(question, tenant_id, doc_ids, history, provider=None) -> dict:
+def run(question, tenant_id, doc_ids, history, provider=None, language=None) -> dict:
     reply = casual_reply(question)
     if reply is not None:
         # Conversational only: the graph is never invoked, so retrieval, the
@@ -310,7 +320,8 @@ def run(question, tenant_id, doc_ids, history, provider=None) -> dict:
                 "abstain_reason": "", "retries": 0, "sufficiency": {}, "providers": "",
                 "evidence": [], "trace": ["casual: conversational reply (no retrieval)"]}
     out = GRAPH.invoke({"question": question, "tenant_id": tenant_id, "doc_ids": doc_ids,
-                        "history": history, "provider": provider, "retries": 0})
+                        "history": history, "provider": provider, "retries": 0,
+                        "language": language})
     # No sources, no model name in the result — retrieval details stay server-side.
     return _result(out)
 

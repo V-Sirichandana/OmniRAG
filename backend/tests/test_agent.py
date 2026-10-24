@@ -155,11 +155,12 @@ def _reset_llm(answer="Stub answer.", verify='{"grounded": true, "score": 90, "u
     REWRITER["text"] = rewriter
 
 
-def _run_as(username, question, baseline=False):
+def _run_as(username, question, baseline=False, language=None):
     u = USERS[username]
     doc_ids = authz.visible_doc_ids(u)          # exactly what /api/chat computes
-    fn = agent.run_baseline if baseline else agent.run
-    return fn(question, u["tenant_id"], doc_ids, [])
+    if baseline:
+        return agent.run_baseline(question, u["tenant_id"], doc_ids, [])
+    return agent.run(question, u["tenant_id"], doc_ids, [], language=language)
 
 
 TESTS: list = []
@@ -711,6 +712,32 @@ def test_casual_gate_leaves_document_questions_and_abstentions_intact():
     r2 = _run_as("hr_member", "Does the company offer paternity leave?")
     assert r2["abstained"] is True, r2
     assert "couldn't find this" in r2["answer"].lower()
+
+
+@test
+def test_language_instruction_reaches_generation_only():
+    _reset_llm(answer="Seis semanas de permiso.")
+    r = _run_as("hr_member", VAC_Q, language="Spanish")
+    assert CALLS, "the draft model must be called"
+    # the instruction exists in exactly one prompt — the generation one
+    tagged = [c for c in CALLS if "(Answer strictly in Spanish)" in c["prompt"]]
+    assert len(tagged) == 1, f"expected exactly one tagged prompt, got {len(tagged)}"
+    assert "Sources:" in tagged[0]["prompt"], "the tagged prompt must be the answer prompt"
+    # retrieval and the sufficiency gate saw the RAW question: this question is
+    # answerable from the authorized document and must not abstain
+    assert r["abstained"] is False, r
+    assert r["evidence"], "authorized evidence must still be retrieved"
+    assert "Seis semanas" in r["answer"]
+
+
+@test
+def test_clean_markers_keeps_legitimate_bracketed_numbers():
+    from app import agent as A
+    kept = A.clean_markers(
+        "Employees accrue 20 paid vacation days [2024] per year (see chapter [401]).")
+    assert "[2024]" in kept and "[401]" in kept, kept
+    stripped = A.clean_markers("Two approvals are required. [1][2]")
+    assert "[1]" not in stripped and "[2]" not in stripped, stripped
 
 
 def main():

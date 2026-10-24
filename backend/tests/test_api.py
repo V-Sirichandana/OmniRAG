@@ -1410,6 +1410,84 @@ def test_thanks_prefixed_document_question_still_goes_through_rag():
     assert "key" in r.json()["detail"].lower()
 
 
+# --- Stability pass: destructive ordering, races, scope guard, language ------
+
+@test
+def test_rejected_reupload_preserves_the_previous_document():
+    t = auth(STATE["acme"]["token"])
+    first = upload(STATE["acme"]["token"], "Handbook2.txt", "Version one.\n",
+                   visibility="org", department="Human Resources")
+    assert first.status_code == 200, first.text
+    before = first.json()
+
+    # (a) an unknown ACL target must be rejected BEFORE anything is replaced
+    bad_acl = upload(STATE["acme"]["token"], "Handbook2.txt", "Version two.\n",
+                     visibility="restricted", allowed="no-such-user")
+    assert bad_acl.status_code == 400, bad_acl.text
+
+    # (b) a file with no extractable text must fail without replacing either
+    empty = upload(STATE["acme"]["token"], "Handbook2.txt", "",
+                   visibility="org", department="Human Resources")
+    assert empty.status_code == 422, empty.text
+
+    docs = [d for d in client.get("/api/documents", headers=t).json()
+            if d["filename"] == "Handbook2.txt"]
+    assert len(docs) == 1, "a rejected upload must neither duplicate nor delete the original"
+    assert docs[0]["id"] == before["id"] and docs[0]["chunks"] == before["chunks"]
+
+
+@test
+def test_department_scope_change_requires_an_existing_department():
+    t = auth(STATE["acme"]["token"])
+    doc = upload(STATE["acme"]["token"], "OrgWide.txt", "Company-wide memo.\n",
+                 visibility="organization")
+    assert doc.status_code == 200, doc.text
+    doc_id = doc.json()["id"]
+    # An organization-scoped document stores no department: applying
+    # "department" scope would hide it from every member while reporting ok.
+    r = client.patch(f"/api/documents/{doc_id}/access", headers=t,
+                     json={"visibility": "department", "download_allowed": True})
+    assert r.status_code == 400, r.text
+    assert "department" in r.json()["detail"].lower()
+    still = [d for d in client.get("/api/documents", headers=t).json() if d["id"] == doc_id]
+    assert still and still[0]["visibility"] == "organization"
+
+
+@test
+def test_invite_claim_statement_grants_the_code_once():
+    # register() consumes an invite with a guarded UPDATE (… AND used_by IS
+    # NULL); pin the statement's semantics: only the first claim can win.
+    r = client.post("/api/admin/invites", headers=auth(STATE["acme"]["token"]),
+                    json={"role": "member", "days": 7})
+    assert r.status_code == 200, r.text
+    code = r.json()["code"]
+    from app import db as D
+    import sqlite3
+    con = sqlite3.connect(D.DB_PATH)
+    try:
+        first = con.execute("UPDATE invites SET used_by=? WHERE code=? AND used_by IS NULL",
+                            ("claimant-1", code)).rowcount
+        second = con.execute("UPDATE invites SET used_by=? WHERE code=? AND used_by IS NULL",
+                             ("claimant-2", code)).rowcount
+    finally:
+        con.close()
+    assert (first, second) == (1, 0), (first, second)
+
+
+@test
+def test_language_selection_reaches_generation_not_the_query():
+    # Before the fix the language suffix was appended to the question, so even
+    # "hi" missed the casual gate; now it reaches only the generation prompt.
+    t = auth(STATE["acme"]["token"])
+    casual = client.post("/api/chat", headers=t, json={"question": "hi", "language": "Spanish"})
+    assert casual.status_code == 200, casual.text
+    assert "Hello!" in casual.json()["answer"]
+    # a real document question with a non-English language still runs RAG
+    real = client.post("/api/chat", headers=t,
+                       json={"question": "How many weeks of parental leave?", "language": "Spanish"})
+    assert real.status_code == 503, (real.status_code, real.text)
+
+
 def main():
     failed = 0
     for fn in TESTS:

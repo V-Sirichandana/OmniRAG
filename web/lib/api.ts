@@ -9,7 +9,9 @@
  */
 import type { Session } from "./types";
 
-const BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+/** API origin — exported so pages that bypass the client (blob downloads)
+ *  still honor NEXT_PUBLIC_API_BASE instead of hardcoding same-origin. */
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 const TOKEN_KEY = "omnirag_token";
 
 export function getToken(): string | null {
@@ -117,7 +119,7 @@ async function request<T>(
   if (opts.auth !== false && token) headers.Authorization = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
 
-  const res = await fetch(`${BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     method: opts.method ?? (opts.body !== undefined || opts.formData ? "POST" : "GET"),
     headers,
     body: opts.formData ?? (opts.body !== undefined ? JSON.stringify(opts.body) : undefined),

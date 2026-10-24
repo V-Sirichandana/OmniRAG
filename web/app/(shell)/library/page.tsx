@@ -23,7 +23,7 @@ import {
   UploadCloud,
   Users,
 } from "lucide-react";
-import { api, ApiError, getToken } from "@/lib/api";
+import { api, ApiError, API_BASE, getToken } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { AdminUser, Department, Doc, Visibility } from "@/lib/types";
 import {
@@ -140,7 +140,10 @@ function LibraryPage() {
   const load = useCallback(() => {
     api
       .get<Doc[]>("/api/documents")
-      .then(setDocs)
+      .then((d) => {
+        setDocs(d);
+        setError(""); // a successful reload clears any earlier failure banner
+      })
       .catch((e) => setError(e instanceof ApiError ? e.message : "Failed to load"))
       .finally(() => setLoading(false));
   }, []);
@@ -152,6 +155,13 @@ function LibraryPage() {
       api.get<AdminUser[]>("/api/admin/users").then(setUsers).catch(() => {});
     }
   }, [load, user?.role]);
+
+  // The topbar search pushes /library?q=…; the useState initializer for q only
+  // runs on first mount, so re-sync whenever the URL query changes while this
+  // page is already mounted (otherwise searching from /library does nothing).
+  useEffect(() => {
+    setQ(search.get("q") ?? "");
+  }, [search]);
 
   function pickFile(f: File | null | undefined) {
     if (!f) return;
@@ -220,7 +230,7 @@ function LibraryPage() {
       return;
     }
     try {
-      const res = await fetch(`/api/documents/${d.id}/download`, {
+      const res = await fetch(`${API_BASE}/api/documents/${d.id}/download`, {
         headers: { Authorization: `Bearer ${token}` },
       });
       if (!res.ok) throw new Error();

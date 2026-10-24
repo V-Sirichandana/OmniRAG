@@ -154,7 +154,7 @@ export default function AdminPage() {
     }
   }
 
-  const copy = (text: string) => void navigator.clipboard?.writeText(text);
+  const copy = (text: string) => void navigator.clipboard?.writeText(text).catch(() => {});
 
   return (
     <div className="mx-auto max-w-6xl space-y-6 px-5 py-8 sm:px-8">

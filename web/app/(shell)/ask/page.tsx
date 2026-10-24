@@ -53,6 +53,8 @@ function AskPage() {
   // conversation id created by the current session's first send — its local
   // transcript is authoritative and must not be clobbered by a refetch race
   const createdRef = useRef<string | null>(null);
+  // mirrors `busy` for use in non-render callbacks (the conversation loader)
+  const busyRef = useRef(false);
   const autoSentRef = useRef(false); // send ?q= exactly once (even under StrictMode)
 
   // provider status banner (LLM key presence)
@@ -63,6 +65,7 @@ function AskPage() {
   // load an existing conversation
   useEffect(() => {
     let alive = true;
+    setError(""); // a previous failure must not linger on a healthy (re)load
     if (!convId) {
       setMessages([]);
       return;
@@ -70,7 +73,8 @@ function AskPage() {
     if (convId === createdRef.current) return; // just created locally — skip refetch
     api
       .get<Message[]>(`/api/conversations/${convId}`)
-      .then((m) => alive && setMessages(m))
+      // a send already in flight owns the transcript — don't wipe it
+      .then((m) => alive && !busyRef.current && setMessages(m))
       .catch((e) => {
         if (e instanceof ApiError && e.status === 404) router.replace("/ask");
         else if (alive) setError("Could not load this conversation.");
@@ -101,10 +105,21 @@ function AskPage() {
     async (text?: string) => {
       const q = (text ?? input).trim();
       if (!q || busy) return;
+      // Enforce the API contract (question: 2..2000 chars) BEFORE any state is
+      // touched, so an over/under-length message never erases the composer.
+      if (q.length < 2 || q.length > 2000) {
+        setError(
+          q.length < 2
+            ? "Please type at least 2 characters."
+            : "That message is too long — please keep it under 2000 characters.",
+        );
+        return;
+      }
       setError("");
       setInput("");
       setMessages((m) => [...m, { role: "user", content: q }]);
       setBusy(true);
+      busyRef.current = true;
       try {
         const res = await api.post<ChatResponse>("/api/chat", {
           question: q,
@@ -120,8 +135,12 @@ function AskPage() {
       } catch (e) {
         setError(errorToMessage(e)); // normalized string — never "[object Object]"
         setMessages((m) => m.slice(0, -1)); // roll back the optimistic user bubble
+        // A failed send must not destroy the question: give it back if the
+        // composer is still empty (never clobber text typed meanwhile).
+        setInput((cur) => (cur.trim() ? cur : q));
       } finally {
         setBusy(false);
+        busyRef.current = false;
       }
     },
     [busy, convId, input, language, router],
@@ -260,7 +279,8 @@ function AskPage() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              // !isComposing: IME users commit a composition with Enter
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 void send();
               }
