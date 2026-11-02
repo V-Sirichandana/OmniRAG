@@ -112,9 +112,9 @@ export function errorToMessage(e: unknown): string {
 
 async function request<T>(
   path: string,
-  opts: { method?: string; body?: unknown; formData?: FormData; auth?: boolean } = {},
+  opts: { method?: string; body?: unknown; formData?: FormData; auth?: boolean; headers?: Record<string, string> } = {},
 ): Promise<T> {
-  const headers: Record<string, string> = {};
+  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
   const token = getToken();
   if (opts.auth !== false && token) headers.Authorization = `Bearer ${token}`;
   if (opts.body !== undefined) headers["Content-Type"] = "application/json";
@@ -141,7 +141,8 @@ async function request<T>(
 
 export const api = {
   get: <T,>(path: string) => request<T>(path),
-  post: <T,>(path: string, body?: unknown) => request<T>(path, { method: "POST", body }),
+  post: <T,>(path: string, body?: unknown, headers?: Record<string, string>) =>
+    request<T>(path, { method: "POST", body, headers }),
   patch: <T,>(path: string, body: unknown) => request<T>(path, { method: "PATCH", body }),
   del: <T,>(path: string) => request<T>(path, { method: "DELETE" }),
   upload: <T,>(path: string, formData: FormData) =>

@@ -10,7 +10,7 @@
  * (renaming the organization, changing your own password) the UI says so
  * instead of showing a dead control.
  */
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import {
   Building2,
@@ -18,6 +18,7 @@ import {
   FileText,
   History,
   KeyRound,
+  Loader2,
   Lock,
   ScrollText,
   ShieldCheck,
@@ -25,7 +26,7 @@ import {
   UserRound,
   Users,
 } from "lucide-react";
-import { api, ApiError } from "@/lib/api";
+import { api, ApiError, getToken, API_BASE } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import type { AdminUser, AuditEntry, Department, Doc, Stats, Visibility } from "@/lib/types";
 import {
@@ -38,6 +39,8 @@ import {
   PageHeader,
   Panel,
 } from "@/components/ui";
+
+const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? "";
 
 type Tab = "profile" | "company" | "departments" | "members" | "access" | "security";
 
@@ -87,6 +90,69 @@ export default function SettingsPage() {
   const [audit, setAudit] = useState<AuditEntry[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
+
+  // Google account linking
+  const [linkPassword, setLinkPassword] = useState("");
+  const [linkBusy, setLinkBusy] = useState(false);
+  const [linkError, setLinkError] = useState("");
+  const [linkOk, setLinkOk] = useState(false);
+  const [googleBusy, setGoogleBusy] = useState(false);
+  const [googleError, setGoogleError] = useState("");
+  const googleBtnRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return;
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      const g = (window as any).google;
+      if (!g?.accounts?.id) return;
+      g.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: async (resp: { credential?: string }) => {
+          if (!resp?.credential) {
+            setGoogleError("Google did not return a credential.");
+            return;
+          }
+          if (!linkPassword) {
+            setGoogleError("Enter your current password first.");
+            return;
+          }
+          setGoogleBusy(true);
+          setGoogleError("");
+          try {
+            await api.post("/api/auth/link-google", {
+              password: linkPassword,
+              credential: resp.credential,
+            }, { "X-Requested-With": "XMLHttpRequest" });
+            setLinkOk(true);
+            setLinkPassword("");
+          } catch (err) {
+            setGoogleError(
+              err instanceof ApiError ? err.message : "Linking failed. Is the API running?",
+            );
+          } finally {
+            setGoogleBusy(false);
+          }
+        },
+      });
+      if (googleBtnRef.current) {
+        g.accounts.id.renderButton(googleBtnRef.current, {
+          type: "standard",
+          theme: "outline",
+          size: "large",
+          text: "continue_with",
+          width: 280,
+        });
+      }
+    };
+    document.head.appendChild(script);
+    return () => {
+      try { document.head.removeChild(script); } catch {}
+    };
+  }, [linkPassword]);
 
   const load = useCallback(() => {
     if (!user) return;
@@ -197,6 +263,31 @@ export default function SettingsPage() {
               ))}
             </dl>
           </Panel>
+
+          {GOOGLE_CLIENT_ID && (
+            <Panel icon={KeyRound} title="Link Google account" subtitle="Sign in with Google using this account">
+              <div className="space-y-3 text-xs text-slate-600">
+                <p>
+                  Re-enter your current password, then click Continue with Google.
+                  The Google account email must match your work email.
+                </p>
+              <div className="space-y-1">
+                <label className="block text-xs font-medium text-slate-600">Current password</label>
+                <input
+                  type="password"
+                  className="w-full rounded-lg border border-line-2 bg-white px-3.5 py-2.5 text-sm text-slate-900 placeholder:text-slate-400 outline-none transition focus:border-brand-2 focus:ring-2 focus:ring-brand/20"
+                  value={linkPassword}
+                  onChange={(e) => setLinkPassword(e.target.value)}
+                  autoComplete="current-password"
+                />
+              </div>
+                <div ref={googleBtnRef} className="flex justify-center" />
+                {googleBusy && <p className="text-center text-xs text-slate-500">Linking…</p>}
+                <ErrorNote>{googleError}</ErrorNote>
+                {linkOk && <p className="text-xs text-emerald-600">Google account linked successfully.</p>}
+              </div>
+            </Panel>
+          )}
 
           <Panel icon={Lock} title="Security" subtitle="How your session works">
             <ul className="space-y-2.5 text-xs leading-relaxed text-slate-600">

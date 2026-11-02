@@ -1,7 +1,7 @@
 import time, bcrypt, jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from .config import JWT_SECRET
+from .config import JWT_SECRET, GOOGLE_CLIENT_ID
 from .db import db
 
 bearer = HTTPBearer(auto_error=False)
@@ -32,11 +32,50 @@ def current_user(cred: HTTPAuthorizationCredentials = Depends(bearer)) -> dict:
         row = c.execute(
             "SELECT u.id,u.username,u.email,u.role,u.tenant_id,u.department,u.employee_id,"
             "u.is_manager,u.full_name,u.employment_type,u.agreement_start,u.agreement_end,"
-            "t.name AS tenant_name "
+            "u.google_sub,u.disabled,t.name AS tenant_name "
             "FROM users u JOIN tenants t ON t.id=u.tenant_id WHERE u.id=?", (uid,)).fetchone()
     if not row: raise HTTPException(401, "User no longer exists")
-    return dict(row)
+    row = dict(row)
+    if row.get("disabled"):
+        raise HTTPException(403, "Account is disabled")
+    return row
 
 def admin_user(user=Depends(current_user)) -> dict:
     if user["role"] != "admin": raise HTTPException(403, "Administrator access required")
     return user
+
+
+def verify_google_credential(credential: str) -> dict:
+    """Verify a Google ID token and return its claims.
+
+    Uses Google's official google-auth library (verify_oauth2_token), which
+    checks the signature, issuer, audience and expiry. Returns a dict with at
+    least 'sub', 'email', 'email_verified' (and 'name' when present).
+    Raises HTTPException(401) on any failure. Never logs the token.
+    """
+    if not credential or not isinstance(credential, str):
+        raise HTTPException(400, "Missing Google credential")
+    from . import config as _cfg
+    client_id = _cfg.GOOGLE_CLIENT_ID
+    if not client_id:
+        raise HTTPException(503, "Google sign-in is not configured")
+    try:
+        from google.oauth2 import id_token as _id_token
+        from google.auth.transport import requests as _grequests
+        claims = _id_token.verify_oauth2_token(credential, _grequests.Request(), client_id)
+    except Exception:
+        raise HTTPException(401, "Invalid or expired Google credential")
+    # verify_oauth2_token already validates aud/iss/exp; enforce email verification
+    # explicitly and re-check audience defensively.
+    if claims.get("aud") != client_id:
+        raise HTTPException(401, "Invalid Google audience")
+    if not claims.get("email_verified"):
+        raise HTTPException(401, "Google email is not verified")
+    if not claims.get("sub") or not claims.get("email"):
+        raise HTTPException(401, "Incomplete Google identity")
+    return {
+        "sub": claims["sub"],
+        "email": str(claims["email"]).strip().lower(),
+        "email_verified": bool(claims.get("email_verified")),
+        "name": claims.get("name"),
+    }

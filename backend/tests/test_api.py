@@ -1673,6 +1673,331 @@ def test_csv_template_download_unauthenticated_rejected():
 
 
 
+@test
+def test_google_auth_not_configured_returns_503():
+    import app.config as C, app.main as M
+    old = C.GOOGLE_CLIENT_ID
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    try:
+        r = client.post("/api/auth/google", json={"credential": "x"}, headers={"X-Requested-With": "XMLHttpRequest"})
+        assert r.status_code == 503, r.status_code
+    finally:
+        C.GOOGLE_CLIENT_ID = old
+        M.GOOGLE_CLIENT_ID = old
+
+
+@test
+def test_google_auth_invalid_token_rejected():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    with patch("google.oauth2.id_token.verify_oauth2_token", side_effect=ValueError("bad")):
+        r = client.post("/api/auth/google", json={"credential": "bad-token"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 401, r.status_code
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_google_auth_wrong_audience_rejected():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    payload = {"sub": "g-123", "email": "u@test.com", "email_verified": True, "aud": "other-client"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 401, r.status_code
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_google_auth_unverified_email_rejected():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    payload = {"sub": "g-123", "email": "u@test.com", "email_verified": False, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 401, r.status_code
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_google_auth_unlinked_account_not_auto_linked():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "glinkuser", "glink@test.com", S.hash_pw("Password123!"), tid, "member", "General"))
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    payload = {"sub": "g-new-sub", "email": "glink@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 403, r.status_code
+    with D.db() as c:
+        row = c.execute("SELECT google_sub FROM users WHERE username=?", ("glinkuser",)).fetchone()
+        assert row["google_sub"] is None
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_google_auth_linked_account_login():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department,google_sub,disabled) VALUES(?,?,?,?,?,?,?,?,?)",
+                  (uid, "glinked", "glinked@test.com", S.hash_pw("Password123!"), tid, "member", "General", "g-sub-999", 0))
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    payload = {"sub": "g-sub-999", "email": "glinked@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 200, r.text
+    assert "token" in r.json()
+    with D.db() as c:
+        c.execute("UPDATE users SET disabled=1 WHERE google_sub=?", ("g-sub-999",))
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r2 = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r2.status_code == 403, r2.status_code
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE google_sub=?", ("g-sub-999",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_google_auth_tenant_isolation():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department,google_sub) VALUES(?,?,?,?,?,?,?,?)",
+                  (uid, "giso", "giso@test.com", S.hash_pw("Password123!"), tid, "member", "General", "g-iso-sub"))
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    payload = {"sub": "g-iso-sub", "email": "giso@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 200
+    assert r.json()["user"]["tenant_id"] == tid
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE google_sub=?", ("g-iso-sub",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_requires_password_and_matching_email():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "linkme", "linkme@test.com", S.hash_pw("Password123!"), tid, "member", "General"))
+    sess = client.post("/api/auth/login", json={"username": "linkme", "password": "Password123!"}).json()
+    ut = {"Authorization": "Bearer " + sess["token"]}
+    payload = {"sub": "g-link-sub", "email": "linkme@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "XMLHttpRequest"}, json={"password": "WrongPass1!", "credential": "tok"})
+    assert r.status_code == 401, r.status_code
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r2 = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "XMLHttpRequest"}, json={"password": "Password123!", "credential": "tok"})
+    assert r2.status_code == 200, r2.text
+    with D.db() as c:
+        row = c.execute("SELECT google_sub FROM users WHERE username=?", ("linkme",)).fetchone()
+        assert row["google_sub"] == "g-link-sub"
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r3 = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r3.status_code == 200, r3.text
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE username=?", ("linkme",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_email_mismatch_rejected():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "mmuser", "mm@test.com", S.hash_pw("Password123!"), tid, "member", "General"))
+    sess = client.post("/api/auth/login", json={"username": "mmuser", "password": "Password123!"}).json()
+    ut = {"Authorization": "Bearer " + sess["token"]}
+    payload = {"sub": "g-mm-sub", "email": "other@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "XMLHttpRequest"}, json={"password": "Password123!", "credential": "tok"})
+    assert r.status_code == 403, r.status_code
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE username=?", ("mmuser",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_unverified_rejected():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "unvuser", "unv@test.com", S.hash_pw("Password123!"), tid, "member", "General"))
+    sess = client.post("/api/auth/login", json={"username": "unvuser", "password": "Password123!"}).json()
+    ut = {"Authorization": "Bearer " + sess["token"]}
+    payload = {"sub": "g-unv-sub", "email": "unv@test.com", "email_verified": False, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "XMLHttpRequest"}, json={"password": "Password123!", "credential": "tok"})
+    assert r.status_code == 401, r.status_code
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE username=?", ("unvuser",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_already_linked_elsewhere_rejected():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid1 = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department,google_sub) VALUES(?,?,?,?,?,?,?,?)",
+                  (uid1, "linked1", "l1@test.com", S.hash_pw("Password123!"), tid, "member", "General", "g-shared-sub"))
+        uid2 = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department) VALUES(?,?,?,?,?,?,?)",
+                  (uid2, "linked2", "l2@test.com", S.hash_pw("Password123!"), tid, "member", "General"))
+    sess = client.post("/api/auth/login", json={"username": "linked2", "password": "Password123!"}).json()
+    ut = {"Authorization": "Bearer " + sess["token"]}
+    payload = {"sub": "g-shared-sub", "email": "l2@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "XMLHttpRequest"}, json={"password": "Password123!", "credential": "tok"})
+    assert r.status_code == 409, r.status_code
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE username IN (?,?)", ("linked1", "linked2"))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_idempotent_same_sub():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department,google_sub) VALUES(?,?,?,?,?,?,?,?)",
+                  (uid, "idem", "idem@test.com", S.hash_pw("Password123!"), tid, "member", "General", "g-idem-sub"))
+    sess = client.post("/api/auth/login", json={"username": "idem", "password": "Password123!"}).json()
+    ut = {"Authorization": "Bearer " + sess["token"]}
+    payload = {"sub": "g-idem-sub", "email": "idem@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "XMLHttpRequest"}, json={"password": "Password123!", "credential": "tok"})
+    assert r.status_code == 200, r.text
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE username=?", ("idem",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_requires_auth():
+    r = client.post("/api/auth/link-google", json={"password": "x", "credential": "y"}, headers={"X-Requested-With": "XMLHttpRequest"})
+    assert r.status_code == 401, r.status_code
+
+@test
+def test_google_auth_requires_csrf_header():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    from unittest.mock import patch
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    payload = {"sub": "g-csrf", "email": "csrf@test.com", "email_verified": True, "aud": "test-client-id"}
+    with patch("google.oauth2.id_token.verify_oauth2_token", return_value=payload):
+        r = client.post("/api/auth/google", json={"credential": "tok"})
+        assert r.status_code == 403, r.status_code
+        r2 = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "nope"})
+        assert r2.status_code == 403, r2.status_code
+        r3 = client.post("/api/auth/google", json={"credential": "tok"}, headers={"X-Requested-With": "XMLHttpRequest"})
+        assert r3.status_code != 403 or "CSRF" not in r3.text, r3.text
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
+@test
+def test_link_google_requires_csrf_header():
+    import app.config as C, app.main as M
+    from app import db as D, security as S
+    C.GOOGLE_CLIENT_ID = "test-client-id"
+    M.GOOGLE_CLIENT_ID = "test-client-id"
+    S.GOOGLE_CLIENT_ID = "test-client-id"
+    tid = STATE["acme"]["user"]["tenant_id"]
+    with D.db() as c:
+        uid = D.uid()
+        c.execute("INSERT INTO users(id,username,email,pw_hash,tenant_id,role,department) VALUES(?,?,?,?,?,?,?)",
+                  (uid, "csrflink", "csrflink@test.com", S.hash_pw("Password123!"), tid, "member", "General"))
+    sess = client.post("/api/auth/login", json={"username": "csrflink", "password": "Password123!"}).json()
+    ut = {"Authorization": "Bearer " + sess["token"]}
+    r = client.post("/api/auth/link-google", headers=ut, json={"password": "Password123!", "credential": "tok"})
+    assert r.status_code == 403, r.status_code
+    r2 = client.post("/api/auth/link-google", headers={**ut, "X-Requested-With": "nope"}, json={"password": "Password123!", "credential": "tok"})
+    assert r2.status_code == 403, r2.status_code
+    with D.db() as c:
+        c.execute("DELETE FROM users WHERE username=?", ("csrflink",))
+    C.GOOGLE_CLIENT_ID = ""
+    M.GOOGLE_CLIENT_ID = ""
+    S.GOOGLE_CLIENT_ID = ""
+
+
 
 def main():
     failed = 0

@@ -8,7 +8,7 @@
  * reset exists in the backend, so there is intentionally NO
  * forgot-password link (guidance text instead).
  */
-import { useState, type FormEvent } from "react";
+import { useState, type FormEvent, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { KeyRound, Loader2 } from "lucide-react";
@@ -18,6 +18,8 @@ import type { Session } from "@/lib/types";
 import { AuthShell } from "@/components/auth-shell";
 import { ErrorNote, Field, PasswordField, authInputCls } from "@/components/ui";
 
+const GOOGLE_CLIENT_ID = process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID ?? "";
+
 export default function LoginPage() {
   const router = useRouter();
   const { login } = useAuth();
@@ -25,6 +27,60 @@ export default function LoginPage() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
+  const [googleBusy, setGoogleBusy] = useState(false);
+  const [googleError, setGoogleError] = useState("");
+  const googleBtnRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return;
+    const script = document.createElement("script");
+    script.src = "https://accounts.google.com/gsi/client";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      const g = (window as any).google;
+      if (!g?.accounts?.id) return;
+      g.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: async (resp: { credential?: string }) => {
+          if (!resp?.credential) {
+            setGoogleError("Google sign-in did not return a credential.");
+            return;
+          }
+          setGoogleBusy(true);
+          setGoogleError("");
+          try {
+            const session = await api.post<Session>("/api/auth/google", {
+              credential: resp.credential,
+            }, { "X-Requested-With": "XMLHttpRequest" });
+            login(session);
+            router.replace("/dashboard");
+          } catch (err) {
+            setGoogleError(
+              err instanceof ApiError
+                ? err.message
+                : "Google sign-in failed. Is the API running?",
+            );
+          } finally {
+            setGoogleBusy(false);
+          }
+        },
+      });
+      if (googleBtnRef.current) {
+        g.accounts.id.renderButton(googleBtnRef.current, {
+          type: "standard",
+          theme: "outline",
+          size: "large",
+          text: "continue_with",
+          width: 320,
+        });
+      }
+    };
+    document.head.appendChild(script);
+    return () => {
+      try { document.head.removeChild(script); } catch {}
+    };
+  }, [login, router]);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -111,6 +167,24 @@ export default function LoginPage() {
           )}
           {busy ? "Signing in…" : "Sign In"}
         </button>
+
+        {GOOGLE_CLIENT_ID && (
+          <div className="space-y-2">
+            <div className="relative my-2">
+              <div className="absolute inset-0 flex items-center">
+                <span className="w-full border-t border-line" />
+              </div>
+              <div className="relative flex justify-center text-[11px] uppercase tracking-wide text-slate-400">
+                <span className="bg-white px-2">or</span>
+              </div>
+            </div>
+            <div ref={googleBtnRef} className="flex justify-center" />
+            {googleBusy && (
+              <p className="text-center text-xs text-slate-500">Signing in with Google…</p>
+            )}
+            <ErrorNote>{googleError}</ErrorNote>
+          </div>
+        )}
       </form>
     </AuthShell>
   );

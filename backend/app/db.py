@@ -207,6 +207,9 @@ _MIGRATIONS = [
     ("invites", "employment_type", "TEXT NOT NULL DEFAULT 'full_time'"),
     ("invites", "agreement_start", "TEXT"),
     ("invites", "agreement_end", "TEXT"),
+    # Phase 1 Google authentication (additive, backward-compatible).
+    ("users", "google_sub", "TEXT"),
+    ("users", "disabled", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -258,6 +261,10 @@ def init():
             "ON users (lower(email)) WHERE email IS NOT NULL" if PG else
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_ci "
             "ON users(email COLLATE NOCASE) WHERE email IS NOT NULL")
+        # Phase 1: unique Google subject id (partial, so legacy password
+        # accounts with NULL google_sub are unaffected).
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_google_sub "
+                  "ON users(google_sub) WHERE google_sub IS NOT NULL")
         # Existing tenants (from older local databases) get default departments too.
         for r in c.execute("SELECT id FROM tenants").fetchall():
             seed_departments(c, r["id"])

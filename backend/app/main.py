@@ -9,7 +9,7 @@ import json, mimetypes, os, secrets, string, time, csv, io
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
@@ -172,6 +172,8 @@ def login(b: Login):
             r = c.execute("SELECT * FROM users WHERE username=?", (name,)).fetchone()
     if not r or not S.check_pw(b.password, r["pw_hash"]):
         S.record_fail(name); raise HTTPException(401, "Invalid username or password")
+    if r["disabled"]:
+        raise HTTPException(403, "Account is disabled")
     S.clear_fail(name); D.audit(r["tenant_id"], r["id"], "login")
     return _session(r["id"])
 
@@ -242,6 +244,74 @@ def register(b: Register):
         raise
     D.audit(inv["tenant_id"], uid, "user_joined", f"{name} ({dept})")
     return _session(uid)
+
+
+def _csrf_guard(request: Request):
+    if request.headers.get("x-requested-with") != "XMLHttpRequest":
+        raise HTTPException(403, "Missing or invalid CSRF header")
+
+
+class GoogleAuthIn(BaseModel):
+    credential: str
+
+
+@app.post("/api/auth/google")
+def google_auth(b: GoogleAuthIn, _csrf=Depends(_csrf_guard)):
+    """Authenticate an already-linked Google identity (Phase 1).
+
+    Only accounts with google_sub set may sign in. Unlinked password
+    accounts are never linked from an external email claim; secure linking
+    requires a separate verification flow and is deferred. No open
+    registration or automatic tenant membership is created here.
+    """
+    claims = S.verify_google_credential(b.credential)
+    sub = claims["sub"]
+    with D.db() as c:
+        r = c.execute("SELECT * FROM users WHERE google_sub=?", (sub,)).fetchone()
+        if r is None:
+            raise HTTPException(403, "Google account is not linked to an OmniRAG account")
+        if r["disabled"]:
+            raise HTTPException(403, "Account is disabled")
+    D.audit(r["tenant_id"], r["id"], "google_login")
+    return _session(r["id"])
+
+
+class LinkGoogleIn(BaseModel):
+    password: str = Field(min_length=8, max_length=100)
+    credential: str
+
+
+@app.post("/api/auth/link-google")
+def link_google(b: LinkGoogleIn, u=Depends(S.current_user), _csrf=Depends(_csrf_guard)):
+    """Securely link an existing password account to a Google identity.
+
+    Requires password re-verification. The Google ID token is verified on the
+    backend; linking only succeeds when the verified email matches the
+    account's email and the Google subject is not already linked elsewhere.
+    """
+    with D.db() as c:
+        row = c.execute("SELECT * FROM users WHERE id=? AND tenant_id=?", (u["id"], u["tenant_id"])).fetchone()
+        if not row or not S.check_pw(b.password, row["pw_hash"]):
+            raise HTTPException(401, "Invalid password")
+        if row["disabled"]:
+            raise HTTPException(403, "Account is disabled")
+    claims = S.verify_google_credential(b.credential)
+    sub = claims["sub"]
+    if claims["email"] != (row["email"] or "").strip().lower():
+        raise HTTPException(403, "Google email does not match this account")
+    with D.db() as c:
+        if row["google_sub"] == sub:
+            D.audit(u["tenant_id"], u["id"], "google_link", "already linked")
+            return {"ok": True, "linked": True}
+        if row["google_sub"] is not None:
+            raise HTTPException(409, "Account is already linked to a different Google identity")
+        if c.execute("SELECT 1 FROM users WHERE google_sub=? AND id<>?", (sub, u["id"])).fetchone():
+            raise HTTPException(409, "Google identity is already linked to another account")
+        if c.execute("UPDATE users SET google_sub=? WHERE id=? AND tenant_id=? AND google_sub IS NULL",
+                      (sub, u["id"], u["tenant_id"])).rowcount != 1:
+            raise HTTPException(409, "Account is already linked to a different Google identity")
+    D.audit(u["tenant_id"], u["id"], "google_link", "linked")
+    return {"ok": True, "linked": True}
 
 
 @app.get("/api/auth/me")

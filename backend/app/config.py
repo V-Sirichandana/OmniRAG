@@ -31,6 +31,7 @@ DATABASE_URL = os.getenv("DATABASE_URL", "").strip()  # postgres://… or postgr
 JWT_SECRET = os.getenv("JWT_SECRET") or secrets.token_hex(32)  # random per run if unset (sessions reset on restart)
 CORS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",") if o.strip()]
 ALLOW_ORG_SIGNUP = os.getenv("ALLOW_ORG_SIGNUP", "true").lower() == "true"
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
 MIN_RERANK = float(os.getenv("MIN_RERANK_SCORE", "0.05"))
 # Evidence-sufficiency gate (agent): minimum fraction of the question's content
 # terms that must appear in the retrieved evidence before generation is
